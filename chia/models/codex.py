@@ -12,6 +12,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -96,6 +97,12 @@ class ServerError(CodexError):
     error_type = "server_error"
 
 
+class ModelCapacityError(CodexError):
+    """Transient exhaustion of capacity for the selected Codex model."""
+
+    error_type = "model_capacity"
+
+
 class MaxOutputTokensError(CodexError):
     error_type = "max_output_tokens"
 
@@ -112,6 +119,10 @@ _RESET_RE = re.compile(
 _MAX_OUTPUT_RE = re.compile(
     r"\b(?:max(?:imum)? output token(?:s| limit)?|output token limit)"
     r"(?:\s+(?:has been\s+)?(?:reached|exceeded))?\b",
+    re.IGNORECASE,
+)
+_MODEL_CAPACITY_RE = re.compile(
+    re.escape("Selected model is at capacity. Please try a different model."),
     re.IGNORECASE,
 )
 _RATE_LIMIT_RE = re.compile(
@@ -387,6 +398,11 @@ class CodexLLM(LLMCallBase):
         auto_compact_token_limit: int | None = 200_000,
         config=UNSET,
         session_storage_key: str | None = None,
+        capacity_attempts: int = 8,
+        capacity_backoff_base_seconds: float = 15.0,
+        capacity_backoff_multiplier: float = 2.0,
+        capacity_backoff_max_seconds: float = 300.0,
+        capacity_backoff_jitter: float = 0.2,
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
         # (more specific) kwarg; mirror it onto the canonical base flag.
@@ -396,6 +412,21 @@ class CodexLLM(LLMCallBase):
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
+        if capacity_attempts < 1:
+            raise ValueError("capacity_attempts must be at least 1")
+        if capacity_backoff_base_seconds < 0:
+            raise ValueError("capacity_backoff_base_seconds must be non-negative")
+        if capacity_backoff_multiplier < 1:
+            raise ValueError("capacity_backoff_multiplier must be at least 1")
+        if capacity_backoff_max_seconds < 0:
+            raise ValueError("capacity_backoff_max_seconds must be non-negative")
+        if not 0 <= capacity_backoff_jitter <= 1:
+            raise ValueError("capacity_backoff_jitter must be between 0 and 1")
+        self.capacity_attempts = capacity_attempts
+        self.capacity_backoff_base_seconds = capacity_backoff_base_seconds
+        self.capacity_backoff_multiplier = capacity_backoff_multiplier
+        self.capacity_backoff_max_seconds = capacity_backoff_max_seconds
+        self.capacity_backoff_jitter = capacity_backoff_jitter
         self.timeout_seconds = timeout_seconds
         self.model = model
         self.codex_bin = codex_bin
@@ -485,32 +516,65 @@ class CodexLLM(LLMCallBase):
             if exception is not None:
                 exception.usage_metadata = dict(self._last_metadata)
         tool_list = tools or []
+        capacity_attempt = 0
+
+        def invoke_codex(
+            prompt_message: str,
+            continuation_session_id: str | None,
+        ) -> CodexQueryResult:
+            self._last_metadata = {}
+            if continuation_session_id is None:
+                cli = self._run_codex(prompt_message, tool_list)
+            else:
+                cli = self._run_codex(
+                    prompt_message,
+                    tool_list,
+                    resume_session_id=continuation_session_id,
+                )
+            self._call_counter += 1
+            self._last_metadata.update({
+                "model": self.model or "codex-default",
+                "tools": [
+                    {"name": t.name, "hostname": getattr(t, "hostname", None),
+                     "port": getattr(t, "port", None), "node_id": getattr(t, "node_id", None)}
+                    for t in tool_list
+                ],
+            })
+            if profiler.enabled:
+                profiler.add_info(self._last_metadata)
+            return cli
+
         for attempt in range(self.retries):
             prompt_message = user_message
             continuation_session_id: str | None = None
             for continuation_attempt in range(_MAX_OUTPUT_RETRIES + 1):
                 try:
-                    self._last_metadata = {}
-                    if continuation_session_id is None:
-                        cli = self._run_codex(prompt_message, tool_list)
-                    else:
-                        cli = self._run_codex(
-                            prompt_message,
-                            tool_list,
-                            resume_session_id=continuation_session_id,
-                        )
-                    self._call_counter += 1
-                    self._last_metadata.update({
-                        "model": self.model or "codex-default",
-                        "tools": [
-                            {"name": t.name, "hostname": getattr(t, "hostname", None),
-                             "port": getattr(t, "port", None), "node_id": getattr(t, "node_id", None)}
-                            for t in tool_list
-                        ],
-                    })
-                    if profiler.enabled:
-                        profiler.add_info(self._last_metadata)
-                    self._classify_error(cli)
+                    while True:
+                        try:
+                            cli = invoke_codex(
+                                prompt_message,
+                                continuation_session_id,
+                            )
+                            self._classify_error(cli)
+                            break
+                        except ModelCapacityError as exc:
+                            record_attempt(False, exc.error_type)
+                            capacity_attempt += 1
+                            exc.capacity_attempts = capacity_attempt
+                            if capacity_attempt >= self.capacity_attempts:
+                                exc.retries_exhausted = True
+                                exc.retry_after_seconds = self.capacity_backoff_max_seconds
+                                attach_attempt_metadata(exc)
+                                raise
+                            retry_index = capacity_attempt - 1
+                            backoff = self._capacity_backoff_delay(retry_index)
+                            self.logger.warning(
+                                "Model capacity error on attempt %d/%d, backing off %.1fs",
+                                capacity_attempt,
+                                self.capacity_attempts,
+                                backoff,
+                            )
+                            _time.sleep(backoff)
                     record_attempt(True)
                     attach_attempt_metadata()
                     cli.success = True
@@ -523,6 +587,8 @@ class CodexLLM(LLMCallBase):
                 ) as exc:
                     record_attempt(False, exc.error_type)
                     attach_attempt_metadata(exc)
+                    raise
+                except ModelCapacityError:
                     raise
                 except MaxOutputTokensError as exc:
                     record_attempt(False, exc.error_type)
@@ -588,6 +654,18 @@ class CodexLLM(LLMCallBase):
             self._session_bundle = session_bundle
             self._session_bundle_paths = getattr(cli, "session_bundle_paths", ())
         return cli
+
+    def _capacity_backoff_delay(self, retry_index: int) -> float:
+        delay = min(
+            self.capacity_backoff_base_seconds
+            * self.capacity_backoff_multiplier ** retry_index,
+            self.capacity_backoff_max_seconds,
+        )
+        jitter = random.uniform(
+            1 - self.capacity_backoff_jitter,
+            1 + self.capacity_backoff_jitter,
+        )
+        return delay * jitter
 
     @staticmethod
     def _validated_session_storage_key(value: str) -> str:
@@ -1611,6 +1689,12 @@ class CodexLLM(LLMCallBase):
         # exception and logs.
         classification_text = message.replace("_", " ").replace('"', " ")
 
+        if _MODEL_CAPACITY_RE.search(message):
+            raise ModelCapacityError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
         if _MAX_OUTPUT_RE.search(classification_text):
             raise MaxOutputTokensError(
                 node_id=node_id,

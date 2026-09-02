@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import tarfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
 from io import BytesIO
@@ -28,6 +29,7 @@ from chia.models.codex import (
     CodexLLM,
     InvalidRequestError,
     MaxOutputTokensError,
+    ModelCapacityError,
     RateLimitError,
     ServerError,
     UnknownCodexError,
@@ -1029,7 +1031,10 @@ def test_classification_never_uses_stderr_result_or_stream(monkeypatch):
     monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
     cli = _cli(
         returncode=1,
-        stderr="HTTP 400 bad request",
+        stderr=(
+            "HTTP 400 bad request; Selected model is at capacity. "
+            "Please try a different model."
+        ),
         result="maximum output token limit reached",
         stream_result="429 rate limit and 503 service unavailable",
         terminal_message="state db returned stale rollout path",
@@ -1052,6 +1057,29 @@ def test_non_turn_failure_is_always_unknown(status, monkeypatch):
 
     with pytest.raises(UnknownCodexError):
         CodexLLM()._classify_error(cli)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Selected model is at capacity. Please try a different model.",
+        "SELECTED MODEL IS AT CAPACITY. PLEASE TRY A DIFFERENT MODEL.",
+    ],
+)
+def test_classify_model_capacity_as_transient(message, monkeypatch):
+    monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
+
+    with pytest.raises(ModelCapacityError) as caught:
+        CodexLLM()._classify_error(
+            _cli(
+                returncode=1,
+                terminal_status="failed",
+                terminal_message=message,
+            )
+        )
+
+    assert caught.value.error_type == "model_capacity"
+    assert caught.value.raw_message == message
 
 
 @pytest.mark.parametrize(
@@ -1099,6 +1127,54 @@ def test_prompt_preserves_final_retry_error(monkeypatch):
     assert cli.returncode == -1
     assert "UnknownCodexError" in cli.stderr
     assert "something surprising" in cli.stderr
+
+
+def test_prompt_capacity_backoff_is_capped_jittered_and_has_no_final_sleep(
+    monkeypatch,
+):
+    _disable_profiler(monkeypatch)
+    monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
+    calls = 0
+    sleeps = []
+    uniform_bounds = []
+    jitter_factors = iter((0.8, 1.0, 1.2))
+
+    def fake_run_codex(self, user_message, tools):
+        nonlocal calls
+        calls += 1
+        return _cli(
+            returncode=1,
+            terminal_message=(
+                "Selected model is at capacity. Please try a different model."
+            ),
+        )
+
+    def fake_uniform(low, high):
+        uniform_bounds.append((low, high))
+        return next(jitter_factors)
+
+    monkeypatch.setattr(CodexLLM, "_run_codex", fake_run_codex)
+    monkeypatch.setattr(codex_mod.random, "uniform", fake_uniform)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    llm = CodexLLM(
+        retries=1,
+        capacity_attempts=4,
+        capacity_backoff_base_seconds=15,
+        capacity_backoff_multiplier=2,
+        capacity_backoff_max_seconds=40,
+        capacity_backoff_jitter=0.2,
+    )
+
+    with pytest.raises(ModelCapacityError) as caught:
+        llm.prompt("hello", tools=[])
+
+    assert calls == 4
+    assert sleeps == pytest.approx([12, 30, 48])
+    assert uniform_bounds == pytest.approx([(0.8, 1.2)] * 3)
+    assert caught.value.capacity_attempts == 4
+    assert caught.value.retries_exhausted is True
+    assert caught.value.retry_after_seconds == 40
+    assert caught.value.usage_metadata["provider_attempts"] == 4
 
 
 def test_prompt_reports_usage_for_each_retry_attempt(monkeypatch):
@@ -1201,6 +1277,24 @@ def test_codex_error_pickle_preserves_usage_metadata():
     restored = cloudpickle.loads(cloudpickle.dumps(error))
 
     assert restored.usage_metadata == error.usage_metadata
+
+
+def test_capacity_exhaustion_metadata_survives_ray_serialization():
+    error = ModelCapacityError(
+        node_id="test-node",
+        exit_code=1,
+        raw_message="Selected model is at capacity. Please try a different model.",
+    )
+    error.capacity_attempts = 8
+    error.retries_exhausted = True
+    error.retry_after_seconds = 300
+
+    restored = cloudpickle.loads(cloudpickle.dumps(error))
+
+    assert restored.error_type == "model_capacity"
+    assert restored.capacity_attempts == 8
+    assert restored.retries_exhausted is True
+    assert restored.retry_after_seconds == 300
 
 
 live = pytest.mark.skipif(
