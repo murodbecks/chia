@@ -32,6 +32,18 @@ Antigravity
 Codex
 -----
 
+``CodexLLM`` runs in a restricted mode by default: Codex built-in tools and
+ambient MCP servers are disabled, and only the ``ChiaTool`` methods supplied
+to a prompt are enabled. Tool-bearing calls use Codex's ``danger-full-access``
+sandbox because HTTP MCP requires network access; confinement instead comes
+from the isolated working directory, disabled built-ins, and exact MCP method
+allowlist. Set ``allow_builtin_tools=True`` only when the caller intends to
+grant Codex its normal local capabilities.
+
+With ``resume_session=True``, the backend captures the session-bearing subset
+of ``CODEX_HOME`` and carries it with the result so later prompts can resume on
+a different, compatibly configured Ray worker.
+
 .. automodule:: chia.models.codex
 
 Copilot

@@ -31,7 +31,8 @@ dependencies = [
     "graphviz==0.21",
     "boto3>=1.28.0",
     "google-cloud-compute>=1.19.0",
-    "requests>=2.31.0"
+    "requests>=2.31.0",
+    "tomli>=2.0; python_version < '3.11'"
 ]
 
 [project.scripts]

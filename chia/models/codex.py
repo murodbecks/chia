@@ -8,16 +8,28 @@ configuration.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
+import shutil
+import sqlite3
+import stat
 import subprocess
+import tarfile
 import tempfile
 from glob import glob
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import ray
 
@@ -40,7 +52,11 @@ class CodexError(Exception):
         super().__init__(f"{self.error_type} on {node_id}: {raw_message[:200]}")
 
     def __reduce__(self):
-        return (self.__class__, (self.node_id, self.exit_code, self.raw_message))
+        return (
+            self.__class__,
+            (self.node_id, self.exit_code, self.raw_message),
+            self.__dict__,
+        )
 
 
 class RateLimitError(CodexError):
@@ -60,6 +76,7 @@ class RateLimitError(CodexError):
         return (
             self.__class__,
             (self.node_id, self.reset_time, self.raw_message, self.exit_code),
+            self.__dict__,
         )
 
 
@@ -92,27 +109,50 @@ _RESET_RE = re.compile(
     re.IGNORECASE,
 )
 
-_ERROR_PATTERNS: tuple[tuple[type[CodexError], tuple[str, ...]], ...] = (
-    (
-        AuthenticationError,
-        ("not logged in", "login", "authentication", "unauthorized", "401", "api key", "auth token"),
-    ),
-    (BillingError, ("billing", "payment", "402", "credit", "quota exceeded")),
-    (
-        InvalidRequestError,
-        ("invalid request", "malformed", "bad request", "invalid model", "unknown model",
-         "invalid config", "unrecognized option", "400"),
-    ),
-    (
-        ServerError,
-        ("500", "503", "server error", "overloaded", "internal error", "service unavailable",
-         "connection", "timeout", "timed out"),
-    ),
-    (
-        MaxOutputTokensError,
-        ("max output", "maximum output", "output token limit", "context length",
-         "context window", "truncated"),
-    ),
+_MAX_OUTPUT_RE = re.compile(
+    r"\b(?:max(?:imum)? output token(?:s| limit)?|output token limit)"
+    r"(?:\s+(?:has been\s+)?(?:reached|exceeded))?\b",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_RE = re.compile(
+    r"\b(?:rate limit(?:ed| exceeded)?|usage limit|too many requests)\b",
+    re.IGNORECASE,
+)
+_AUTHENTICATION_RE = re.compile(
+    r"\b(?:not logged in|authentication (?:failed|required)|unauthorized|"
+    r"invalid (?:api key|auth token)|expired (?:api key|auth token))\b",
+    re.IGNORECASE,
+)
+_AUTHENTICATION_STATUS_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|code|apierror|error)"
+    r"\s*[:=]?\s*401\b|\b401\s+unauthorized\b",
+    re.IGNORECASE,
+)
+_BILLING_RE = re.compile(
+    r"\b(?:billing(?: error)?|payment required|insufficient credits?|"
+    r"credit balance|quota exceeded)\b",
+    re.IGNORECASE,
+)
+_INVALID_REQUEST_RE = re.compile(
+    r"\b(?:invalid request|malformed request|bad request|invalid model|"
+    r"unknown model|invalid config(?:uration)?|unrecognized option)\b",
+    re.IGNORECASE,
+)
+_INVALID_REQUEST_STATUS_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|code|apierror|error)"
+    r"\s*[:=]?\s*400\b|\b400\s+bad request\b",
+    re.IGNORECASE,
+)
+_SERVER_RE = re.compile(
+    r"\b(?:internal server error|server error|service unavailable|"
+    r"server overloaded|temporarily overloaded)\b",
+    re.IGNORECASE,
+)
+_SERVER_STATUS_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|code|apierror|error)"
+    r"\s*[:=]?\s*50[0234]\b|\b50[0234]\s+"
+    r"(?:internal server error|bad gateway|service unavailable|gateway timeout)\b",
+    re.IGNORECASE,
 )
 
 
@@ -137,26 +177,47 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
-_CODEX_SESSION_STATE_PATTERNS = (
-    "state_*.sqlite",
-    "state_*.sqlite-wal",
-    "state_*.sqlite-shm",
+_RESTRICTED_CODEX_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "multi_agent",
+    "code_mode",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "goals",
 )
+
+_CODEX_SESSION_MANIFEST = ".chia_codex_session.json"
+_CODEX_SESSION_MANIFEST_VERSION = 2
+_CODEX_SESSION_ROOT_ENV = "CHIA_CODEX_SESSION_ROOT"
+_SESSION_STORAGE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MAX_OUTPUT_CONTINUATION = "Continue where you left off. Do not repeat work you already completed."
+_MAX_OUTPUT_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class CodexTerminalOutcome:
+    """Structured outcome reported for the latest Codex JSONL turn."""
+
+    status: str
+    message: str = ""
 
 
 @dataclass
 class CodexQueryResult(QueryResult):
     """QueryResult specialized for the Codex CLI backend.
 
-    Codex stores resumable conversations under ``CODEX_HOME`` rather than in a
-    portable JSONL transcript. The state fields carry the needed opaque files
-    back to the caller so a later ``codex exec resume <session_id> -`` can run
-    on a different Chia worker.
+    Codex stores resumable ``exec`` state under ``CODEX_HOME``. The session
+    bundle carries the small session-bearing subset of that state between
+    workers, analogous to Claude Code's transcript bytes.
     """
 
     session_id: str | None = None
-    session_state: dict[str, bytes] | None = None
-    session_state_paths: tuple[str, ...] = ()
+    session_bundle: bytes | None = None
+    session_bundle_paths: tuple[str, ...] = ()
+    terminal_outcome: CodexTerminalOutcome | None = None
 
 
 def parse_session_id(stdout: str) -> str | None:
@@ -313,9 +374,10 @@ class CodexLLM(LLMCallBase):
         codex_bin: str = "codex",
         work_dir: str | None = None,
         extra_cli_args: list[str] | None = None,
-        sandbox: str = "workspace-write",
+        sandbox: str = "read-only",
         approval_policy: str = "never",
-        dangerously_bypass_approvals_and_sandbox: bool = True,
+        dangerously_bypass_approvals_and_sandbox: bool = False,
+        allow_builtin_tools: bool = False,
         skip_git_repo_check: bool = True,
         ephemeral: bool = False,
         ignore_rules: bool = False,
@@ -324,6 +386,7 @@ class CodexLLM(LLMCallBase):
         resume_session: bool = False,
         auto_compact_token_limit: int | None = 200_000,
         config=UNSET,
+        session_storage_key: str | None = None,
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
         # (more specific) kwarg; mirror it onto the canonical base flag.
@@ -341,6 +404,7 @@ class CodexLLM(LLMCallBase):
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.dangerously_bypass_approvals_and_sandbox = dangerously_bypass_approvals_and_sandbox
+        self.allow_builtin_tools = allow_builtin_tools
         self.skip_git_repo_check = skip_git_repo_check
         self.ephemeral = ephemeral
         self.ignore_rules = ignore_rules
@@ -351,10 +415,32 @@ class CodexLLM(LLMCallBase):
         self._call_counter = 0
         self._resume_session = resume_session
         self._session_id: str | None = None
-        self._session_state: dict[str, bytes] | None = None
-        self._session_state_paths: tuple[str, ...] = ()
+        self._session_bundle: bytes | None = None
+        self._session_bundle_paths: tuple[str, ...] = ()
+        self._session_storage_key = self._validated_session_storage_key(
+            session_storage_key or uuid4().hex
+        )
+        self._session_storage_key_explicit = session_storage_key is not None
+        self._restricted_work_dir = os.path.join(
+            tempfile.gettempdir(), "chia-codex", str(uuid4())
+        )
         self._last_metadata: dict = {}
         self._log_prefix = None
+
+        if not self.allow_builtin_tools and self.dangerously_bypass_approvals_and_sandbox:
+            raise ValueError(
+                "dangerously_bypass_approvals_and_sandbox requires "
+                "allow_builtin_tools=True"
+            )
+        if not self.allow_builtin_tools and self.profile is not None:
+            raise ValueError("profile requires allow_builtin_tools=True")
+        if (
+            not self.allow_builtin_tools
+            and "--dangerously-bypass-approvals-and-sandbox" in self.extra_cli_args
+        ):
+            raise ValueError(
+                "dangerous permission bypass is unavailable when built-in tools are disabled"
+            )
 
         self.logger.warning("CodexLLM is experimental and has not been production-validated.")
         if self.model is None:
@@ -378,72 +464,150 @@ class CodexLLM(LLMCallBase):
 
         profiler = get_profiler()
         last_error = ""
+        attempt_records: list[dict[str, Any]] = []
+
+        def record_attempt(success: bool, error: str = "") -> None:
+            attempt_records.append({
+                "attempt": len(attempt_records) + 1,
+                "success": success,
+                "error": error,
+                "metadata": dict(self._last_metadata or {}),
+            })
+
+        def attach_attempt_metadata(
+            exception: BaseException | None = None,
+        ) -> None:
+            self._last_metadata = {
+                **dict(self._last_metadata or {}),
+                "provider_attempts": len(attempt_records),
+                "attempts": list(attempt_records),
+            }
+            if exception is not None:
+                exception.usage_metadata = dict(self._last_metadata)
+        tool_list = tools or []
         for attempt in range(self.retries):
-            try:
-                tool_list = tools or []
-                self._last_metadata = {}
-                self._restore_session_state()
-                cli = self._run_codex(user_message, tool_list)
-                self._call_counter += 1
-                self._last_metadata.update({
-                    "model": self.model or "codex-default",
-                    "tools": [
-                        {"name": t.name, "hostname": getattr(t, "hostname", None),
-                         "port": getattr(t, "port", None), "node_id": getattr(t, "node_id", None)}
-                        for t in tool_list
-                    ],
-                })
-                if profiler.enabled:
-                    profiler.add_info(self._last_metadata)
-                self._classify_error(cli)
-                self._capture_session_state(cli)
-                cli.success = True
-                return cli
-            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
-                raise
-            except MaxOutputTokensError:
-                if attempt == 0:
-                    self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
-                                        attempt + 1, self.retries)
-                    continue
-                raise
-            except ServerError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                backoff = min(5 * 2 ** attempt, 60)
-                self.logger.warning("Server error on attempt %d/%d, backing off %ds",
-                                    attempt + 1, self.retries, backoff)
-                _time.sleep(backoff)
-            except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                self.logger.warning("Codex attempt %d/%d failed: %s",
-                                    attempt + 1, self.retries, exc)
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
-                                    attempt + 1, self.retries, exc)
-        return CodexQueryResult(
+            prompt_message = user_message
+            continuation_session_id: str | None = None
+            for continuation_attempt in range(_MAX_OUTPUT_RETRIES + 1):
+                try:
+                    self._last_metadata = {}
+                    if continuation_session_id is None:
+                        cli = self._run_codex(prompt_message, tool_list)
+                    else:
+                        cli = self._run_codex(
+                            prompt_message,
+                            tool_list,
+                            resume_session_id=continuation_session_id,
+                        )
+                    self._call_counter += 1
+                    self._last_metadata.update({
+                        "model": self.model or "codex-default",
+                        "tools": [
+                            {"name": t.name, "hostname": getattr(t, "hostname", None),
+                             "port": getattr(t, "port", None), "node_id": getattr(t, "node_id", None)}
+                            for t in tool_list
+                        ],
+                    })
+                    if profiler.enabled:
+                        profiler.add_info(self._last_metadata)
+                    self._classify_error(cli)
+                    record_attempt(True)
+                    attach_attempt_metadata()
+                    cli.success = True
+                    return cli
+                except (
+                    RateLimitError,
+                    AuthenticationError,
+                    BillingError,
+                    InvalidRequestError,
+                ) as exc:
+                    record_attempt(False, exc.error_type)
+                    attach_attempt_metadata(exc)
+                    raise
+                except MaxOutputTokensError as exc:
+                    record_attempt(False, exc.error_type)
+                    if continuation_attempt >= _MAX_OUTPUT_RETRIES:
+                        attach_attempt_metadata(exc)
+                        raise
+                    continuation_session_id = getattr(cli, "session_id", None)
+                    if not continuation_session_id:
+                        attach_attempt_metadata(exc)
+                        raise
+                    prompt_message = _MAX_OUTPUT_CONTINUATION
+                    self.logger.warning(
+                        "Max output tokens; continuing session (%d/%d)",
+                        continuation_attempt + 1,
+                        _MAX_OUTPUT_RETRIES,
+                    )
+                except ServerError as exc:
+                    record_attempt(False, exc.error_type)
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    backoff = min(5 * 2 ** attempt, 60)
+                    self.logger.warning("Server error on attempt %d/%d, backing off %ds",
+                                        attempt + 1, self.retries, backoff)
+                    _time.sleep(backoff)
+                    break
+                except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
+                    record_attempt(
+                        False,
+                        getattr(exc, "error_type", type(exc).__name__),
+                    )
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    self.logger.warning("Codex attempt %d/%d failed: %s",
+                                        attempt + 1, self.retries, exc)
+                    break
+                except Exception as exc:
+                    record_attempt(False, type(exc).__name__)
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
+                                        attempt + 1, self.retries, exc)
+                    break
+        attach_attempt_metadata()
+        result = CodexQueryResult(
             result="",
             returncode=-1,
             stderr=last_error,
             stream_result="",
             success=False,
             session_id=self._session_id,
-            session_state=self._session_state,
-            session_state_paths=self._session_state_paths,
+            session_bundle=self._session_bundle,
+            session_bundle_paths=self._session_bundle_paths,
         )
+        result.usage_metadata = dict(self._last_metadata)
+        return result
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
-        """Copy worker-captured Codex session state onto this instance."""
+        """Copy worker-observed Codex session state onto this instance."""
         if not self._resume_session:
             return cli
         session_id = getattr(cli, "session_id", None)
-        session_state = getattr(cli, "session_state", None)
+        session_bundle = getattr(cli, "session_bundle", None)
         if session_id:
             self._session_id = session_id
-        if session_state is not None:
-            self._session_state = session_state
-            self._session_state_paths = getattr(cli, "session_state_paths", tuple(sorted(session_state)))
+        if session_bundle is not None:
+            self._session_bundle = session_bundle
+            self._session_bundle_paths = getattr(cli, "session_bundle_paths", ())
         return cli
+
+    @staticmethod
+    def _validated_session_storage_key(value: str) -> str:
+        key = str(value).strip()
+        if not _SESSION_STORAGE_KEY_RE.fullmatch(key):
+            raise ValueError(
+                "session_storage_key must be 1-128 characters containing only "
+                "letters, digits, dot, underscore, or hyphen"
+            )
+        return key
+
+    def set_session_storage_key(self, value: str) -> None:
+        """Select the stable on-worker directory name for one logical session."""
+        key = self._validated_session_storage_key(value)
+        if self._session_storage_key_explicit and key != self._session_storage_key:
+            raise ValueError(
+                "cannot change session_storage_key after it has been explicitly set"
+            )
+        self._session_storage_key = key
+        self._session_storage_key_explicit = True
 
     def _get_node_id(self) -> str:
         try:
@@ -456,13 +620,63 @@ class CodexLLM(LLMCallBase):
             return user_message
         return f"[System Instructions]\n{self.system_message}\n\n[User Request]\n{user_message}"
 
+    @staticmethod
+    def _mcp_tool_names(tool: ChiaTool) -> list[str]:
+        return [fn.name for fn in tool.mcp._tool_manager.list_tools()]
+
     def _mcp_config_args(self, tools: list[ChiaTool]) -> list[str]:
         args: list[str] = []
         for tool in tools:
             port = getattr(tool, "port", 8000)
             url = f"http://{tool.hostname}:{port}/{tool.name}/mcp"
-            args += ["-c", f"mcp_servers.{_toml_key(tool.name)}.url={_toml(url)}"]
+            prefix = f"mcp_servers.{_toml_key(tool.name)}"
+            args += ["-c", f"{prefix}.url={_toml(url)}"]
+            args += ["-c", f"{prefix}.enabled=true"]
+            # The caller explicitly supplied this ChiaTool and the
+            # ``enabled_tools`` list below restricts the server to those exact
+            # methods.  Pre-approve that allowlist so non-interactive Codex
+            # runs with ``approval_policy=never`` do not fail closed before
+            # the MCP request reaches the Chia worker.
+            args += ["-c", f'{prefix}.default_tools_approval_mode="approve"']
+            args += [
+                "-c",
+                f"{prefix}.enabled_tools={json.dumps(self._mcp_tool_names(tool))}",
+            ]
         return args
+
+    def _configured_mcp_server_names(self) -> list[str]:
+        config_path = os.path.join(self._codex_home(), "config.toml")
+        try:
+            with open(config_path, "rb") as config_file:
+                config = tomllib.load(config_file)
+        except (OSError, tomllib.TOMLDecodeError):
+            return []
+        servers = config.get("mcp_servers", {})
+        return sorted(servers) if isinstance(servers, dict) else []
+
+    def _restricted_args(self) -> list[str]:
+        if self.allow_builtin_tools:
+            return []
+        args = ["--ignore-rules"]
+        for feature in _RESTRICTED_CODEX_FEATURES:
+            args += ["--disable", feature]
+        for server_name in self._configured_mcp_server_names():
+            prefix = f"mcp_servers.{_toml_key(server_name)}"
+            args += ["-c", f"{prefix}.enabled=false"]
+        return args
+
+    def _effective_work_dir(self) -> str | None:
+        if self.allow_builtin_tools:
+            return self.work_dir
+        os.makedirs(self._restricted_work_dir, exist_ok=True)
+        return self._restricted_work_dir
+
+    def _effective_sandbox(self, tools: list[ChiaTool]) -> str:
+        # Codex's read-only sandbox also blocks the network used by HTTP MCP.
+        # Restricted mode still exposes only the explicitly supplied tools.
+        if tools and not self.allow_builtin_tools:
+            return "danger-full-access"
+        return self.sandbox
 
     def _build_cmd(
         self,
@@ -473,6 +687,8 @@ class CodexLLM(LLMCallBase):
         cmd = [self.codex_bin]
         if not self.dangerously_bypass_approvals_and_sandbox and self.approval_policy:
             cmd += ["--ask-for-approval", self.approval_policy]
+        if not self.dangerously_bypass_approvals_and_sandbox:
+            cmd += ["--sandbox", self._effective_sandbox(tools or [])]
         if resume_session_id:
             cmd += ["exec", "resume", "--json"]
         else:
@@ -481,8 +697,9 @@ class CodexLLM(LLMCallBase):
             cmd += ["--model", self.model]
         if self.profile:
             cmd += ["--profile", self.profile]
-        if self.work_dir and not resume_session_id:
-            cmd += ["--cd", self.work_dir]
+        work_dir = self._effective_work_dir()
+        if work_dir and not resume_session_id:
+            cmd += ["--cd", work_dir]
         if self.skip_git_repo_check:
             cmd.append("--skip-git-repo-check")
         if self.ephemeral:
@@ -491,135 +708,563 @@ class CodexLLM(LLMCallBase):
             cmd.append("--ignore-rules")
         if self.dangerously_bypass_approvals_and_sandbox:
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            cmd += ["--sandbox", self.sandbox]
         if output_last_message_path:
             cmd += ["--output-last-message", output_last_message_path]
         if self.reasoning_effort:
             cmd += ["-c", f"model_reasoning_effort={_toml(self.reasoning_effort)}"]
         if self.auto_compact_token_limit is not None:
             cmd += ["-c", f"model_auto_compact_token_limit={self.auto_compact_token_limit}"]
-        cmd += self._mcp_config_args(tools or [])
         cmd += self.extra_cli_args
+        cmd += self._restricted_args()
+        cmd += self._mcp_config_args(tools or [])
         if resume_session_id:
             return cmd + [resume_session_id, "-"]
         return cmd + ["-"]
 
-    def _run_codex(self, user_message: str, tools: list[ChiaTool] | None = None) -> CodexQueryResult:
+    def _run_codex(
+        self,
+        user_message: str,
+        tools: list[ChiaTool] | None = None,
+        *,
+        resume_session_id: str | None = None,
+    ) -> CodexQueryResult:
         fd, output_path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
+        session_home = None
+        session_lock_fd = None
         try:
-            resume_session_id = self._session_id if self._resume_session else None
+            env = os.environ.copy()
+            if self._resume_session:
+                session_lock_fd = self._acquire_session_lock()
+                session_home = self._prepare_session_home()
+                env["CODEX_HOME"] = session_home
+            telemetry_home = session_home or self._codex_home()
+            active_resume_session_id = (
+                resume_session_id
+                or (self._session_id if self._resume_session else None)
+            )
+            rollout_offsets = self._rollout_offsets(
+                telemetry_home,
+                active_resume_session_id,
+            )
             result = subprocess.run(
                 self._build_cmd(
                     tools or [],
                     output_last_message_path=output_path,
-                    resume_session_id=resume_session_id,
+                    resume_session_id=active_resume_session_id,
                 ),
                 input=self._format_prompt(user_message),
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
-                cwd=self.work_dir or None,
-                env=os.environ.copy(),
+                cwd=self._effective_work_dir(),
+                env=env,
             )
             with open(output_path) as f:
                 final_text = f.read()
-            stream, meta, fallback = self._parse_jsonl_stream(result.stdout, result.stderr)
+            stream, meta, fallback, terminal_outcome = self._parse_jsonl_stream(
+                result.stdout,
+                result.stderr,
+                resumed=active_resume_session_id is not None,
+            )
             parsed_session_id = parse_session_id(result.stdout)
             if self._resume_session and parsed_session_id:
                 self._session_id = parsed_session_id
+            returned_session_id = (
+                parsed_session_id
+                or active_resume_session_id
+                or self._session_id
+            )
+            telemetry_session_id = returned_session_id
+            meta.update(
+                self._rollout_context_metadata(
+                    telemetry_home,
+                    telemetry_session_id,
+                    rollout_offsets,
+                )
+            )
             if self._session_id:
                 meta["session_id"] = self._session_id
+            meta["codex_terminal_status"] = terminal_outcome.status
             self._last_metadata = meta
             final_text = final_text or fallback
             if self._log_prefix is not None:
                 self._write_log(user_message, final_text, stream)
             if result.returncode != 0:
                 self.logger.warning("codex exited %d: %s", result.returncode, result.stderr[:500])
+            if self._resume_session and session_home is not None and self._session_id:
+                self._capture_session_bundle(session_home)
             return CodexQueryResult(
                 final_text,
                 result.returncode,
                 result.stderr,
                 stream,
-                session_id=self._session_id,
+                session_id=returned_session_id,
+                session_bundle=self._session_bundle,
+                session_bundle_paths=self._session_bundle_paths,
+                terminal_outcome=terminal_outcome,
             )
         finally:
             try:
                 os.unlink(output_path)
             except FileNotFoundError:
                 pass
+            if session_home is not None:
+                shutil.rmtree(session_home, ignore_errors=True)
+            if session_lock_fd is not None:
+                self._release_session_lock(session_lock_fd)
 
     def _codex_home(self) -> str:
         return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
-    def _session_state_files(self) -> list[tuple[str, str]]:
-        home = self._codex_home()
-        paths: list[tuple[str, str]] = []
-        for pattern in _CODEX_SESSION_STATE_PATTERNS:
-            dirname = os.path.dirname(pattern)
-            basename = os.path.basename(pattern)
-            root = os.path.join(home, dirname)
-            if not os.path.isdir(root):
-                continue
-            for name in os.listdir(root):
-                if not re.fullmatch(basename.replace(".", r"\.").replace("*", ".*"), name):
-                    continue
-                full = os.path.join(root, name)
-                if os.path.isfile(full):
-                    paths.append((os.path.relpath(full, home), full))
-        return sorted(set(paths))
-
-    def _path_relative_to_codex_home(self, path: str) -> str | None:
-        home = os.path.abspath(self._codex_home())
-        full = os.path.abspath(path if os.path.isabs(path) else os.path.join(home, path))
-        try:
-            if os.path.commonpath([home, full]) != home:
-                return None
-        except ValueError:
-            return None
-        return os.path.relpath(full, home)
-
-    def _session_rollout_files(self) -> list[tuple[str, str]]:
-        if self._session_id is None:
+    @staticmethod
+    def _rollout_paths(home: str, session_id: str | None) -> list[str]:
+        if not session_id:
             return []
-        home = self._codex_home()
-        paths: list[tuple[str, str]] = []
-        pattern = os.path.join(home, "sessions", "**", f"rollout-*{self._session_id}*.jsonl")
-        for full_rollout in glob(pattern, recursive=True):
-            rel_rollout = self._path_relative_to_codex_home(full_rollout)
-            if rel_rollout is not None and os.path.isfile(full_rollout):
-                paths.append((rel_rollout, full_rollout))
-        return sorted(set(paths))
+        pattern = os.path.join(
+            home,
+            "sessions",
+            "*",
+            "*",
+            "*",
+            f"rollout-*{session_id}*.jsonl",
+        )
+        return sorted(glob(pattern))
 
-    def _restore_session_state(self) -> None:
-        if not self._resume_session or self._session_state is None:
-            return
-        home = self._codex_home()
-        for rel_path, data in self._session_state.items():
-            if os.path.isabs(rel_path) or rel_path.startswith(".."):
-                continue
-            path = os.path.join(home, rel_path)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(data)
-
-    def _capture_session_state(self, cli: CodexQueryResult) -> None:
-        if not self._resume_session or self._session_id is None:
-            return
-        state: dict[str, bytes] = {}
-        for rel_path, path in self._session_state_files() + self._session_rollout_files():
+    @classmethod
+    def _rollout_offsets(
+        cls,
+        home: str,
+        session_id: str | None,
+    ) -> dict[str, int]:
+        offsets = {}
+        for path in cls._rollout_paths(home, session_id):
             try:
-                with open(path, "rb") as f:
-                    state[rel_path] = f.read()
+                offsets[path] = os.path.getsize(path)
             except OSError:
                 continue
-        if state:
-            self._session_state = state
-            self._session_state_paths = tuple(sorted(state))
-            cli.session_state = state
-            cli.session_state_paths = self._session_state_paths
-        cli.session_id = self._session_id
+        return offsets
+
+    @classmethod
+    def _rollout_context_metadata(
+        cls,
+        home: str,
+        session_id: str | None,
+        offsets: dict[str, int],
+    ) -> dict[str, Any]:
+        """Read only the rollout events appended by one Codex invocation."""
+        events = []
+        for path in cls._rollout_paths(home, session_id):
+            try:
+                size = os.path.getsize(path)
+                offset = offsets.get(path, 0)
+                if offset > size:
+                    offset = 0
+                with open(path, "rb") as rollout:
+                    rollout.seek(offset)
+                    for line in rollout:
+                        try:
+                            event = json.loads(line)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        payload = _payload(event)
+                        event_type = str(
+                            payload.get("type") or event.get("type") or ""
+                        ).lower()
+                        if event_type == "compacted":
+                            events.append({
+                                "type": "compacted",
+                                "payload": {"trigger": payload.get("trigger")},
+                            })
+                        elif event_type == "token_count":
+                            events.append(event)
+            except OSError:
+                continue
+        return cls._context_metadata_from_rollout_events(events)
+
+    @staticmethod
+    def _context_metadata_from_rollout_events(
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Normalize Codex context gauges and compaction markers."""
+        context_tokens = None
+        peak_context_tokens = None
+        model_context_window = None
+        compactions: list[dict[str, Any]] = []
+        pending_compaction = None
+        saw_context_telemetry = False
+
+        for event in events:
+            payload = _payload(event)
+            event_type = str(
+                payload.get("type") or event.get("type") or ""
+            ).lower()
+            if event_type == "compacted":
+                trigger = payload.get("trigger")
+                compactions.append({
+                    "trigger": trigger if isinstance(trigger, str) else None,
+                    "before_tokens": context_tokens,
+                    "after_tokens": None,
+                })
+                pending_compaction = len(compactions) - 1
+                saw_context_telemetry = True
+                continue
+            if event_type != "token_count":
+                continue
+
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            window = info.get("model_context_window")
+            if isinstance(window, (int, float)):
+                model_context_window = int(window)
+            usage = info.get("last_token_usage")
+            if not isinstance(usage, dict):
+                continue
+
+            input_tokens = usage.get("input_tokens")
+            total_tokens = usage.get("total_tokens")
+            component_fields = (
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            )
+            zero_component_gauge = (
+                isinstance(total_tokens, (int, float))
+                and total_tokens > 0
+                and all(
+                    isinstance(usage.get(field), (int, float))
+                    and usage.get(field) == 0
+                    for field in component_fields
+                )
+            )
+            if zero_component_gauge:
+                next_context_tokens = int(total_tokens)
+            elif isinstance(input_tokens, (int, float)):
+                next_context_tokens = int(input_tokens)
+            else:
+                continue
+
+            context_tokens = next_context_tokens
+            peak_context_tokens = max(
+                next_context_tokens,
+                peak_context_tokens or 0,
+            )
+            if pending_compaction is not None:
+                compactions[pending_compaction]["after_tokens"] = (
+                    next_context_tokens
+                )
+                pending_compaction = None
+            saw_context_telemetry = True
+
+        if not saw_context_telemetry:
+            return {}
+        utilization = (
+            context_tokens / model_context_window
+            if context_tokens is not None and model_context_window else None
+        )
+        return {
+            "context_tokens": context_tokens,
+            "peak_context_tokens": peak_context_tokens,
+            "model_context_window": model_context_window,
+            "context_window_utilization": utilization,
+            "context_compactions": compactions,
+        }
+
+    def _prepare_session_home(self) -> str:
+        """Create the stable CODEX_HOME for this session and restore its state."""
+        base_home = self._codex_home()
+        if self._session_bundle:
+            manifest = self._session_bundle_manifest(self._session_bundle)
+            self._apply_session_bundle_manifest(manifest)
+        session_home = self._session_home_path()
+        try:
+            if os.path.lexists(session_home):
+                if os.path.islink(session_home) or not os.path.isdir(session_home):
+                    raise ValueError(
+                        f"refusing unsafe Codex session home {session_home!r}"
+                    )
+                shutil.rmtree(session_home)
+            os.mkdir(session_home, mode=0o700)
+            self._seed_session_home(base_home, session_home)
+            if self._session_bundle:
+                self._restore_session_bundle(session_home, self._session_bundle)
+            return session_home
+        except BaseException:
+            shutil.rmtree(session_home, ignore_errors=True)
+            raise
+
+    def _session_root(self) -> str:
+        configured = os.environ.get(_CODEX_SESSION_ROOT_ENV)
+        root = os.path.abspath(
+            os.path.expanduser(
+                configured
+                or os.path.join(os.path.expanduser("~"), ".chia-codex-sessions")
+            )
+        )
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        root_stat = os.lstat(root)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError(f"refusing unsafe Codex session root {root!r}")
+        mode = stat.S_IMODE(root_stat.st_mode)
+        if mode & 0o077:
+            os.chmod(root, 0o700)
+        return root
+
+    def _session_home_path(self) -> str:
+        root = self._session_root()
+        session_home = os.path.abspath(
+            os.path.join(root, self._session_storage_key)
+        )
+        if os.path.commonpath((root, session_home)) != root or session_home == root:
+            raise ValueError(f"refusing unsafe Codex session home {session_home!r}")
+        return session_home
+
+    def _acquire_session_lock(self) -> int:
+        if self._session_bundle:
+            manifest = self._session_bundle_manifest(self._session_bundle)
+            self._apply_session_bundle_manifest(manifest)
+        root = self._session_root()
+        lock_path = os.path.join(root, f".{self._session_storage_key}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _release_session_lock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _seed_session_home(self, base_home: str, session_home: str) -> None:
+        for name in ("auth.json", "AGENTS.md"):
+            src = os.path.join(base_home, name)
+            dst = os.path.join(session_home, name)
+            if not os.path.exists(src):
+                continue
+            try:
+                shutil.copy2(src, dst, follow_symlinks=False)
+            except OSError:
+                self.logger.debug("failed to seed Codex session home entry %s", src, exc_info=True)
+        config_src = os.path.join(base_home, "config.toml")
+        if os.path.exists(config_src):
+            self._seed_config_file(config_src, os.path.join(session_home, "config.toml"), base_home)
+
+    def _seed_config_file(self, src: str, dst: str, base_home: str) -> None:
+        try:
+            with open(src, encoding="utf-8") as f:
+                text = f.read()
+            parsed = tomllib.loads(text)
+            rewritten = self._rewrite_local_marketplace_sources(text, parsed, base_home)
+            if rewritten == text:
+                shutil.copy2(src, dst, follow_symlinks=False)
+                return
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(rewritten)
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            self.logger.debug("failed to rewrite Codex config %s", src, exc_info=True)
+            try:
+                shutil.copy2(src, dst, follow_symlinks=False)
+            except OSError:
+                self.logger.debug("failed to seed Codex config %s", src, exc_info=True)
+
+    def _rewrite_local_marketplace_sources(
+        self,
+        text: str,
+        parsed: dict[str, Any],
+        base_home: str,
+    ) -> str:
+        rewrites = self._local_marketplace_source_rewrites(parsed, base_home)
+        if not rewrites:
+            return text
+        current_marketplace: str | None = None
+        lines: list[str] = []
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[["):
+                section = stripped[1:-1].strip()
+                current_marketplace = None
+                if section.startswith("marketplaces."):
+                    current_marketplace = section.split(".", 1)[1].strip('"')
+            if current_marketplace in rewrites:
+                match = re.match(r"^(\s*)source\s*=", line)
+                if match:
+                    newline = "\n" if line.endswith("\n") else ""
+                    line = f"{match.group(1)}source = {json.dumps(rewrites[current_marketplace])}{newline}"
+            lines.append(line)
+        return "".join(lines)
+
+    def _local_marketplace_source_rewrites(
+        self,
+        parsed: dict[str, Any],
+        base_home: str,
+    ) -> dict[str, str]:
+        rewrites: dict[str, str] = {}
+        marketplaces = parsed.get("marketplaces")
+        if not isinstance(marketplaces, dict):
+            return rewrites
+        for name, config in marketplaces.items():
+            if not isinstance(config, dict) or config.get("source_type") != "local":
+                continue
+            source = config.get("source")
+            if not isinstance(source, str) or not source:
+                continue
+            marketplace_dir = os.path.basename(source.rstrip(os.sep))
+            candidate = os.path.join(base_home, "local-marketplaces", marketplace_dir)
+            if os.path.isdir(candidate) and os.path.abspath(candidate) != os.path.abspath(source):
+                rewrites[str(name)] = candidate
+        return rewrites
+
+    @staticmethod
+    def _session_bundle_manifest(bundle: bytes) -> dict[str, Any]:
+        with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name != _CODEX_SESSION_MANIFEST or not member.isfile():
+                    continue
+                source = tar.extractfile(member)
+                if source is None:
+                    continue
+                with source:
+                    manifest = json.loads(source.read().decode("utf-8"))
+                if not isinstance(manifest, dict):
+                    break
+                return manifest
+        raise ValueError("Codex session bundle is missing a valid manifest")
+
+    def _apply_session_bundle_manifest(self, manifest: dict[str, Any]) -> None:
+        version = manifest.get("version")
+        if version != _CODEX_SESSION_MANIFEST_VERSION:
+            raise ValueError(
+                "unsupported Codex session bundle version "
+                f"{version!r}; expected {_CODEX_SESSION_MANIFEST_VERSION}"
+            )
+        bundle_key = self._validated_session_storage_key(
+            manifest.get("session_storage_key", "")
+        )
+        if (
+            self._session_storage_key_explicit
+            and bundle_key != self._session_storage_key
+        ):
+            raise ValueError(
+                "Codex session bundle belongs to a different session_storage_key"
+            )
+        self._session_storage_key = bundle_key
+        self._session_storage_key_explicit = True
+        expected_home = self._session_home_path()
+        bundle_home = manifest.get("session_home")
+        if bundle_home != expected_home:
+            raise ValueError(
+                "Codex session bundle requires a different absolute session home: "
+                f"bundle={bundle_home!r}, worker={expected_home!r}"
+            )
+        session_id = manifest.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._session_id = session_id
+
+    def _restore_session_bundle(self, session_home: str, bundle: bytes) -> None:
+        manifest = self._session_bundle_manifest(bundle)
+        self._apply_session_bundle_manifest(manifest)
+        with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as tar:
+            members = tar.getmembers()
+            for member in members:
+                if not member.isfile():
+                    continue
+                rel_path = member.name
+                if rel_path == _CODEX_SESSION_MANIFEST:
+                    continue
+                if self._unsafe_bundle_path(rel_path):
+                    continue
+                if not self._is_session_bundle_file(rel_path):
+                    continue
+                target = os.path.join(session_home, rel_path)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None:
+                    continue
+                with source, open(target, "wb") as f:
+                    shutil.copyfileobj(source, f)
+
+    @staticmethod
+    def _unsafe_bundle_path(rel_path: str) -> bool:
+        normalized = rel_path.replace("\\", "/")
+        return (
+            normalized.startswith("/")
+            or any(part == ".." for part in normalized.split("/"))
+        )
+
+    def _session_bundle_files(self, session_home: str) -> list[tuple[str, str]]:
+        paths: list[tuple[str, str]] = []
+        for root, _dirs, files in os.walk(session_home):
+            for name in files:
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, session_home).replace(os.sep, "/")
+                if self._is_session_bundle_file(rel):
+                    paths.append((rel, full))
+        return sorted(paths)
+
+    def _is_session_bundle_file(self, rel_path: str) -> bool:
+        rel_path = rel_path.replace("\\", "/")
+        base = os.path.basename(rel_path)
+        if re.fullmatch(r"state_\d+\.sqlite", base):
+            return True
+        return (
+            rel_path.startswith("sessions/")
+            and base.startswith("rollout-")
+            and base.endswith(".jsonl")
+        )
+
+    def _capture_session_bundle(self, session_home: str) -> None:
+        paths = self._session_bundle_files(session_home)
+        if not paths and not self._session_id:
+            return
+        buf = BytesIO()
+        bundle_paths: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="chia-codex-snapshot-") as snapshot_dir:
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                manifest = json.dumps(
+                    {
+                        "version": _CODEX_SESSION_MANIFEST_VERSION,
+                        "session_id": self._session_id,
+                        "session_storage_key": self._session_storage_key,
+                        "session_home": os.path.abspath(session_home),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+                info = tarfile.TarInfo(_CODEX_SESSION_MANIFEST)
+                info.mode = 0o600
+                info.size = len(manifest)
+                tar.addfile(info, BytesIO(manifest))
+                bundle_paths.append(_CODEX_SESSION_MANIFEST)
+                for rel_path, full in paths:
+                    source = full
+                    if rel_path.endswith(".sqlite"):
+                        source = os.path.join(snapshot_dir, rel_path)
+                        os.makedirs(os.path.dirname(source), exist_ok=True)
+                        self._snapshot_sqlite(full, source)
+                    tar.add(source, arcname=rel_path, recursive=False)
+                    bundle_paths.append(rel_path)
+        self._session_bundle = buf.getvalue()
+        self._session_bundle_paths = tuple(bundle_paths)
+
+    @staticmethod
+    def _snapshot_sqlite(source: str, destination: str) -> None:
+        """Create a complete SQLite backup without copying WAL/SHM files."""
+        source_db = sqlite3.connect(source)
+        destination_db = sqlite3.connect(destination)
+        try:
+            source_db.backup(destination_db)
+        finally:
+            destination_db.close()
+            source_db.close()
 
     def _write_log(self, user_message: str, final_text: str, stream: str) -> None:
         prompt = user_message[:500] + ("..." if len(user_message) > 500 else "")
@@ -634,20 +1279,33 @@ class CodexLLM(LLMCallBase):
             f.write("-" * 80 + "\n\n")
 
     @classmethod
-    def _parse_jsonl_stream(cls, stdout: str, stderr: str = "") -> tuple[str, dict, str]:
+    def _parse_jsonl_stream(
+        cls,
+        stdout: str,
+        stderr: str = "",
+        *,
+        resumed: bool = False,
+    ) -> tuple[str, dict, str, CodexTerminalOutcome]:
         stream_parts: list[str] = []
         result_parts: list[str] = []
-        meta: dict[str, Any] = {}
+        events: list[dict[str, Any]] = []
         for line in stdout.splitlines():
             event = cls._json_or_none(line)
             if event is None:
                 stream_parts.append(f"[UNPARSED] {_truncate(line.strip(), 200)}\n")
                 continue
-            cls._record_usage(event, meta)
+            events.append(event)
             cls._record_event(event, stream_parts, result_parts)
+        meta = cls._usage_for_latest_task(events, resumed=resumed)
+        terminal_outcome = cls._terminal_outcome(events)
         if stderr:
             stream_parts.append(f"[stderr]\n{_truncate(stderr)}\n\n")
-        return "".join(stream_parts), {k: v for k, v in meta.items() if v}, "".join(result_parts)
+        return (
+            "".join(stream_parts),
+            meta,
+            "".join(result_parts),
+            terminal_outcome,
+        )
 
     @staticmethod
     def _json_or_none(line: str) -> dict | None:
@@ -694,45 +1352,304 @@ class CodexLLM(LLMCallBase):
         return str(value)
 
     @staticmethod
-    def _record_usage(event: dict, meta: dict) -> None:
-        payload = _payload(event)
-        etype = str(payload.get("type") or event.get("type") or "").lower()
-        if "turn" in etype and any(token in etype for token in ("complete", "end", "done")):
-            meta["num_turns"] = meta.get("num_turns", 0) + 1
-        usage = payload.get("usage") or payload.get("tokens") or payload.get("token_usage")
-        if isinstance(payload.get("info"), dict):
-            usage = usage or payload["info"].get("last_token_usage") or payload["info"].get("total_token_usage")
+    def _usage_values(usage: dict | None) -> dict[str, int]:
+        """Normalize one provider usage object without changing subset semantics."""
         if not isinstance(usage, dict):
-            return
+            return {}
+        values: dict[str, int] = {}
         for dest, sources in _TOKEN_ALIASES.items():
             for source in sources:
                 value = usage.get(source)
                 if isinstance(value, (int, float)):
-                    meta[dest] = meta.get(dest, 0) + value
+                    values[dest] = int(value)
+                    break
         cache = usage.get("cache")
         if isinstance(cache, dict):
-            for source, dest in (("read", "cache_read_input_tokens"),
-                                 ("write", "cache_creation_input_tokens")):
-                if isinstance(cache.get(source), (int, float)):
-                    meta[dest] = meta.get(dest, 0) + cache[source]
+            if isinstance(cache.get("read"), (int, float)):
+                values["cache_read_input_tokens"] = int(cache["read"])
+            if isinstance(cache.get("write"), (int, float)):
+                values["cache_creation_input_tokens"] = int(cache["write"])
+        return values
+
+    @staticmethod
+    def _event_type(event: dict) -> str:
+        payload = _payload(event)
+        return str(payload.get("type") or event.get("type") or "").lower()
+
+    @classmethod
+    def _terminal_outcome(
+        cls,
+        events: list[dict[str, Any]],
+    ) -> CodexTerminalOutcome:
+        """Read the latest turn's structured outcome from Codex JSONL.
+
+        Codex reports one failed request with both a top-level ``error`` event
+        and a following ``turn.failed`` event.  The former describes the
+        error; it is not a second turn ending.  Prefer an unambiguous turn
+        outcome and use a top-level error only when no turn outcome exists.
+        """
+        latest_turn_start = None
+        for index, event in enumerate(events):
+            if str(event.get("type") or "").lower() == "turn.started":
+                latest_turn_start = index
+
+        scoped_events = (
+            events[latest_turn_start:]
+            if latest_turn_start is not None
+            else events
+        )
+        turn_outcomes: list[CodexTerminalOutcome] = []
+        stream_errors: list[str] = []
+        for event in scoped_events:
+            # Lifecycle state comes from the top-level protocol event. In
+            # particular, item.completed can contain item.type == "error"
+            # without failing the turn.
+            event_type = str(event.get("type") or "").lower()
+            if event_type == "turn.completed":
+                turn_outcomes.append(CodexTerminalOutcome("completed"))
+            elif event_type == "turn.failed":
+                error = event.get("error")
+                message = cls._text(error) if isinstance(error, dict) else ""
+                turn_outcomes.append(CodexTerminalOutcome("failed", message))
+            elif event_type == "error":
+                stream_errors.append(
+                    cls._text(event) or json.dumps(event, sort_keys=True)
+                )
+
+        if len(turn_outcomes) == 1:
+            return turn_outcomes[0]
+        if len(turn_outcomes) > 1:
+            return CodexTerminalOutcome(
+                "invalid",
+                "Codex JSONL stream contained multiple turn outcomes for the latest turn",
+            )
+        if stream_errors:
+            return CodexTerminalOutcome("fatal", stream_errors[-1])
+        if not turn_outcomes:
+            return CodexTerminalOutcome(
+                "missing",
+                "Codex JSONL stream ended without a terminal turn event",
+            )
+        raise AssertionError("unreachable terminal-outcome state")
+
+    @classmethod
+    def _usage_for_latest_task(
+        cls,
+        events: list[dict[str, Any]],
+        *,
+        resumed: bool = False,
+    ) -> dict[str, Any]:
+        """Return additive usage for only the task started by this invocation.
+
+        ``codex exec resume --json`` may replay token-count events for the
+        complete session. Those events include cumulative session totals, so
+        summing the whole stream charges every prior task again.
+        """
+        task_starts = [
+            index
+            for index, event in enumerate(events)
+            if "task" in cls._event_type(event)
+            and any(
+                token in cls._event_type(event)
+                for token in ("start", "begin", "created")
+            )
+        ]
+        turn_starts = [
+            index
+            for index, event in enumerate(events)
+            if "turn" in cls._event_type(event)
+            and any(
+                token in cls._event_type(event)
+                for token in ("start", "begin")
+            )
+        ]
+        start = (
+            task_starts[-1]
+            if task_starts
+            else (turn_starts[-1] if turn_starts else 0)
+        )
+
+        baseline_total: dict[str, int] = {}
+        for event in events[:start]:
+            info = _payload(event).get("info")
+            if not isinstance(info, dict):
+                continue
+            values = cls._usage_values(info.get("total_token_usage"))
+            if values:
+                baseline_total = values
+
+        direct_usage_events: list[dict[str, int]] = []
+        last_usage_events: list[dict[str, int]] = []
+        latest_total: dict[str, int] = {}
+        turns = 0
+        for event in events[start:]:
+            payload = _payload(event)
+            event_type = cls._event_type(event)
+            if "turn" in event_type and any(
+                token in event_type for token in ("complete", "end", "done")
+            ):
+                turns += 1
+
+            info = payload.get("info")
+            if isinstance(info, dict):
+                values = cls._usage_values(info.get("last_token_usage"))
+                if values:
+                    last_usage_events.append(values)
+                values = cls._usage_values(info.get("total_token_usage"))
+                if values:
+                    latest_total = values
+
+            direct_usage = (
+                payload.get("usage")
+                or payload.get("tokens")
+                or payload.get("token_usage")
+            )
+            values = cls._usage_values(direct_usage)
+            if values and "token_count" not in event_type:
+                direct_usage_events.append(values)
+
+        usage: dict[str, int] = {}
+        usage_source = "unavailable"
+        if direct_usage_events:
+            for values in direct_usage_events:
+                for key, value in values.items():
+                    usage[key] = usage.get(key, 0) + value
+            usage_source = "turn_usage"
+        elif latest_total and baseline_total:
+            keys = set(latest_total) | set(baseline_total)
+            candidate = {
+                key: latest_total.get(key, 0) - baseline_total.get(key, 0)
+                for key in keys
+            }
+            if all(value >= 0 for value in candidate.values()):
+                usage = candidate
+                usage_source = "session_total_delta"
+        elif latest_total and not resumed:
+            usage = dict(latest_total)
+            usage_source = "session_total"
+
+        if not usage and last_usage_events:
+            # Some CLI versions expose only per-subturn snapshots. Deduplicate
+            # replayed copies while retaining distinct subturns.
+            seen: set[tuple[tuple[str, int], ...]] = set()
+            for values in last_usage_events:
+                signature = tuple(sorted(values.items()))
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                for key, value in values.items():
+                    usage[key] = usage.get(key, 0) + value
+            usage_source = "latest_task_usage"
+
+        meta: dict[str, Any] = {
+            **usage,
+            "usage_source": usage_source,
+            "num_turns": turns,
+        }
+        if latest_total:
+            meta["session_total_usage"] = latest_total
+        return meta
+
+    @classmethod
+    def _record_usage(cls, event: dict, meta: dict) -> None:
+        """Compatibility helper for callers parsing one isolated event."""
+        payload = _payload(event)
+        event_type = cls._event_type(event)
+        if "turn" in event_type and any(
+            token in event_type for token in ("complete", "end", "done")
+        ):
+            meta["num_turns"] = meta.get("num_turns", 0) + 1
+        values = cls._usage_values(
+            payload.get("usage")
+            or payload.get("tokens")
+            or payload.get("token_usage")
+        )
+        for key, value in values.items():
+            meta[key] = meta.get(key, 0) + value
 
     def _classify_error(self, cli: QueryResult) -> None:
-        combined = "\n".join(part for part in (cli.stderr, cli.result, cli.stream_result) if part)
-        lower = combined.lower()
-        if (
-            any(k in lower for k in ("rate limit", "usage limit", "too many requests"))
-            or _RATE_LIMIT_429_RE.search(combined)
-        ):
+        outcome = getattr(cli, "terminal_outcome", None)
+        if outcome is None:
+            outcome = CodexTerminalOutcome(
+                "missing",
+                "Codex result did not include a JSONL terminal outcome",
+            )
+
+        # Match normal CLI process semantics.  A zero exit status accompanied
+        # by the requested final-message output is a usable successful call.
+        # JSONL lifecycle records remain valuable for failure classification,
+        # but inconsistencies or duplicate diagnostic events must not override
+        # a response that Codex itself completed and wrote to the output file.
+        if cli.returncode == 0 and bool((cli.result or "").strip()):
+            return
+
+        node_id = self._get_node_id()
+        if cli.returncode == 0 and outcome.status != "failed":
+            raise UnknownCodexError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=(
+                    "Codex exited successfully but did not write a final message "
+                    f"(terminal status: {outcome.status})"
+                ),
+            )
+
+        message = outcome.message or cli.stderr
+        if not message:
+            message = f"Codex terminal status: {outcome.status}"
+        if outcome.status != "failed":
+            raise UnknownCodexError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+
+        # Codex commonly embeds provider errors as JSON text inside the
+        # turn.failed message (for example ``"status":400`` and
+        # ``"type":"invalid_request_error"``). Normalize JSON punctuation
+        # for classification while preserving the original message in the
+        # exception and logs.
+        classification_text = message.replace("_", " ").replace('"', " ")
+
+        if _MAX_OUTPUT_RE.search(classification_text):
+            raise MaxOutputTokensError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+        if _RATE_LIMIT_RE.search(classification_text) or _RATE_LIMIT_429_RE.search(classification_text):
             raise RateLimitError(
-                node_id=self._get_node_id(),
-                reset_time=parse_rate_limit_reset(combined),
-                raw_message=combined[:300],
+                node_id=node_id,
+                reset_time=parse_rate_limit_reset(message),
+                raw_message=message,
                 exit_code=cli.returncode,
             )
-        if cli.returncode == 0:
-            return
-        node_id = self._get_node_id()
-        for error_cls, patterns in _ERROR_PATTERNS:
-            if any(pattern in lower for pattern in patterns):
-                raise error_cls(node_id=node_id, exit_code=cli.returncode, raw_message=combined[:300])
-        raise UnknownCodexError(node_id=node_id, exit_code=cli.returncode, raw_message=combined[:300])
+        if _AUTHENTICATION_RE.search(classification_text) or _AUTHENTICATION_STATUS_RE.search(classification_text):
+            raise AuthenticationError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+        if _BILLING_RE.search(classification_text):
+            raise BillingError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+        if _INVALID_REQUEST_RE.search(classification_text) or _INVALID_REQUEST_STATUS_RE.search(classification_text):
+            raise InvalidRequestError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+        if _SERVER_RE.search(classification_text) or _SERVER_STATUS_RE.search(classification_text):
+            raise ServerError(
+                node_id=node_id,
+                exit_code=cli.returncode,
+                raw_message=message,
+            )
+        raise UnknownCodexError(
+            node_id=node_id,
+            exit_code=cli.returncode,
+            raw_message=message,
+        )
