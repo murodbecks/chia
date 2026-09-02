@@ -607,10 +607,15 @@ class CodexLLM(LLMCallBase):
                 except ServerError as exc:
                     record_attempt(False, exc.error_type)
                     last_error = f"{type(exc).__name__}: {exc}"
-                    backoff = min(5 * 2 ** attempt, 60)
-                    self.logger.warning("Server error on attempt %d/%d, backing off %ds",
-                                        attempt + 1, self.retries, backoff)
-                    _time.sleep(backoff)
+                    if attempt + 1 < self.retries:
+                        backoff = min(5 * 2 ** attempt, 60)
+                        self.logger.warning(
+                            "Server error on attempt %d/%d, backing off %ds",
+                            attempt + 1,
+                            self.retries,
+                            backoff,
+                        )
+                        _time.sleep(backoff)
                     break
                 except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
                     record_attempt(
@@ -1519,24 +1524,18 @@ class CodexLLM(LLMCallBase):
         complete session. Those events include cumulative session totals, so
         summing the whole stream charges every prior task again.
         """
-        task_starts = [
-            index
-            for index, event in enumerate(events)
-            if "task" in cls._event_type(event)
-            and any(
-                token in cls._event_type(event)
-                for token in ("start", "begin", "created")
-            )
-        ]
-        turn_starts = [
-            index
-            for index, event in enumerate(events)
-            if "turn" in cls._event_type(event)
-            and any(
-                token in cls._event_type(event)
-                for token in ("start", "begin")
-            )
-        ]
+        task_starts = []
+        turn_starts = []
+        for index, event in enumerate(events):
+            event_type = cls._event_type(event)
+            if "task" in event_type and any(
+                token in event_type for token in ("start", "begin", "created")
+            ):
+                task_starts.append(index)
+            if "turn" in event_type and any(
+                token in event_type for token in ("start", "begin")
+            ):
+                turn_starts.append(index)
         start = (
             task_starts[-1]
             if task_starts
@@ -1687,30 +1686,18 @@ class CodexLLM(LLMCallBase):
                 raw_message=message,
                 exit_code=cli.returncode,
             )
-        if _AUTHENTICATION_RE.search(classification_text) or _AUTHENTICATION_STATUS_RE.search(classification_text):
-            raise AuthenticationError(
-                node_id=node_id,
-                exit_code=cli.returncode,
-                raw_message=message,
-            )
-        if _BILLING_RE.search(classification_text):
-            raise BillingError(
-                node_id=node_id,
-                exit_code=cli.returncode,
-                raw_message=message,
-            )
-        if _INVALID_REQUEST_RE.search(classification_text) or _INVALID_REQUEST_STATUS_RE.search(classification_text):
-            raise InvalidRequestError(
-                node_id=node_id,
-                exit_code=cli.returncode,
-                raw_message=message,
-            )
-        if _SERVER_RE.search(classification_text) or _SERVER_STATUS_RE.search(classification_text):
-            raise ServerError(
-                node_id=node_id,
-                exit_code=cli.returncode,
-                raw_message=message,
-            )
+        for error_cls, patterns in (
+            (AuthenticationError, (_AUTHENTICATION_RE, _AUTHENTICATION_STATUS_RE)),
+            (BillingError, (_BILLING_RE,)),
+            (InvalidRequestError, (_INVALID_REQUEST_RE, _INVALID_REQUEST_STATUS_RE)),
+            (ServerError, (_SERVER_RE, _SERVER_STATUS_RE)),
+        ):
+            if any(pattern.search(classification_text) for pattern in patterns):
+                raise error_cls(
+                    node_id=node_id,
+                    exit_code=cli.returncode,
+                    raw_message=message,
+                )
         raise UnknownCodexError(
             node_id=node_id,
             exit_code=cli.returncode,

@@ -37,6 +37,8 @@ from chia.models.codex import (
     parse_rate_limit_reset,
 )
 
+_SESSION_ID = "123e4567-e89b-12d3-a456-426614174000"
+
 
 def _event(event_type, **kwargs):
     return json.dumps({"type": event_type, **kwargs})
@@ -63,6 +65,26 @@ def _cli(
             terminal_message,
         ),
     )
+
+
+def _make_session_bundle(
+    manifest: dict,
+    files: tuple[tuple[str, bytes], ...] = (),
+) -> bytes:
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        entries = (
+            (
+                codex_mod._CODEX_SESSION_MANIFEST,
+                json.dumps(manifest).encode("utf-8"),
+            ),
+            *files,
+        )
+        for rel_path, content in entries:
+            info = tarfile.TarInfo(rel_path)
+            info.size = len(content)
+            tar.addfile(info, BytesIO(content))
+    return buf.getvalue()
 
 
 def _fake_subprocess(monkeypatch, capture, *, stdout="", stderr="", returncode=0, final="PONG"):
@@ -171,7 +193,7 @@ def test_build_cmd_flags_and_reasoning_effort():
 
 
 def test_build_cmd_resume_flags_and_reasoning_effort():
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     llm = CodexLLM(
         model="gpt-test",
         work_dir="/tmp/work",
@@ -261,7 +283,7 @@ def test_parse_rate_limit_reset():
 
 
 def test_parse_session_id_from_jsonl():
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     stdout = "\n".join([
         _event("turn_start"),
         json.dumps({"type": "session_configured", "session_id": session_id}),
@@ -270,7 +292,7 @@ def test_parse_session_id_from_jsonl():
 
 
 def test_parse_session_id_nested_and_regex_fallback():
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     assert parse_session_id(json.dumps({"payload": {"conversationId": session_id}})) == session_id
     assert parse_session_id(f"created session {session_id}") == session_id
     assert parse_session_id(f"plain uuid {session_id}") is None
@@ -570,7 +592,7 @@ def test_prompt_routes_to_run_codex(monkeypatch):
 
 
 def test_sync_session_copies_session_state_to_local_instance():
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     llm = CodexLLM(resume_session=True)
     cli = CodexQueryResult(
         result="ok",
@@ -590,7 +612,7 @@ def test_sync_session_copies_session_state_to_local_instance():
 
 def test_resume_session_first_call_records_id_and_second_call_resumes(monkeypatch, tmp_path):
     _disable_profiler(monkeypatch)
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     captures = []
     session_homes = []
 
@@ -682,35 +704,29 @@ def test_resume_session_first_call_records_id_and_second_call_resumes(monkeypatc
 
 
 def test_restore_session_bundle_ignores_foreign_and_unsafe_members(monkeypatch, tmp_path):
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     session_root = tmp_path / "session-root"
     session_home = session_root / "test-session"
     session_home.mkdir(parents=True)
-    buf = BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        manifest = json.dumps({
+    bundle = _make_session_bundle(
+        {
             "version": 2,
             "session_id": session_id,
             "session_storage_key": "test-session",
             "session_home": str(session_home),
-        }).encode("utf-8")
-        info = tarfile.TarInfo(codex_mod._CODEX_SESSION_MANIFEST)
-        info.size = len(manifest)
-        tar.addfile(info, BytesIO(manifest))
-        for rel_path, content in (
+        },
+        (
             ("state_5.sqlite", b"state"),
             (f"sessions/2026/07/18/rollout-first-{session_id}.jsonl", b"rollout"),
             ("auth.json", b"bad"),
             ("sessions/../config.toml", b"bad"),
             ("../escape.txt", b"bad"),
-        ):
-            info = tarfile.TarInfo(rel_path)
-            info.size = len(content)
-            tar.addfile(info, BytesIO(content))
+        ),
+    )
 
     monkeypatch.setenv("CHIA_CODEX_SESSION_ROOT", str(session_root))
     llm = CodexLLM(resume_session=True)
-    llm._restore_session_bundle(str(session_home), buf.getvalue())
+    llm._restore_session_bundle(str(session_home), bundle)
 
     assert llm._session_id == session_id
     assert (session_home / "state_5.sqlite").read_bytes() == b"state"
@@ -741,19 +757,16 @@ def test_prepare_session_home_cleans_up_if_bundle_restore_fails(monkeypatch, tmp
 
 
 def test_restore_rejects_legacy_bundle_without_stable_home_key(tmp_path):
-    buf = BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        manifest = json.dumps({
+    bundle = _make_session_bundle(
+        {
             "version": 1,
-            "session_id": "123e4567-e89b-12d3-a456-426614174000",
-        }).encode("utf-8")
-        info = tarfile.TarInfo(codex_mod._CODEX_SESSION_MANIFEST)
-        info.size = len(manifest)
-        tar.addfile(info, BytesIO(manifest))
+            "session_id": _SESSION_ID,
+        }
+    )
 
     with pytest.raises(ValueError, match="unsupported Codex session bundle version"):
         CodexLLM(resume_session=True)._restore_session_bundle(
-            str(tmp_path), buf.getvalue()
+            str(tmp_path), bundle
         )
 
 
@@ -786,21 +799,18 @@ def test_restore_rejects_worker_with_different_absolute_session_root(
     monkeypatch, tmp_path
 ):
     original_home = tmp_path / "worker-a" / "same-session"
-    buf = BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        manifest = json.dumps({
+    bundle = _make_session_bundle(
+        {
             "version": 2,
-            "session_id": "123e4567-e89b-12d3-a456-426614174000",
+            "session_id": _SESSION_ID,
             "session_storage_key": "same-session",
             "session_home": str(original_home),
-        }).encode("utf-8")
-        info = tarfile.TarInfo(codex_mod._CODEX_SESSION_MANIFEST)
-        info.size = len(manifest)
-        tar.addfile(info, BytesIO(manifest))
+        }
+    )
 
     monkeypatch.setenv("CHIA_CODEX_SESSION_ROOT", str(tmp_path / "worker-b"))
     llm = CodexLLM(resume_session=True)
-    llm._session_bundle = buf.getvalue()
+    llm._session_bundle = bundle
 
     with pytest.raises(ValueError, match="different absolute session home"):
         llm._prepare_session_home()
@@ -825,7 +835,7 @@ def test_capture_snapshots_committed_wal_without_wal_or_shm(monkeypatch, tmp_pat
             resume_session=True,
             session_storage_key="wal-session",
         )
-        llm._session_id = "123e4567-e89b-12d3-a456-426614174000"
+        llm._session_id = _SESSION_ID
         llm._capture_session_bundle(str(session_home))
     finally:
         writer.close()
@@ -901,7 +911,7 @@ def test_run_codex_subprocess_flow(monkeypatch):
 
 
 def test_run_codex_merges_rollout_context_metadata(monkeypatch, tmp_path):
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
     capture = {}
 
     def fake_run(cmd, **kwargs):
@@ -1128,6 +1138,28 @@ def test_prompt_preserves_final_retry_error(monkeypatch):
     assert "something surprising" in cli.stderr
 
 
+def test_prompt_server_backoff_does_not_sleep_after_final_attempt(monkeypatch):
+    _disable_profiler(monkeypatch)
+    monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
+    calls = 0
+    sleeps = []
+
+    def fake_run_codex(self, user_message, tools):
+        nonlocal calls
+        calls += 1
+        return _cli(returncode=1, terminal_message="503 service unavailable")
+
+    monkeypatch.setattr(CodexLLM, "_run_codex", fake_run_codex)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    cli = CodexLLM(retries=3).prompt("hello", tools=[])
+
+    assert calls == 3
+    assert sleeps == [5, 10]
+    assert cli.success is False
+    assert "ServerError" in cli.stderr
+
+
 def test_prompt_capacity_backoff_is_capped_jittered_and_has_no_final_sleep(
     monkeypatch,
 ):
@@ -1195,7 +1227,7 @@ def test_prompt_reports_usage_for_each_retry_attempt(monkeypatch):
             return _cli(
                 returncode=1,
                 terminal_message="max output token limit reached",
-                session_id="123e4567-e89b-12d3-a456-426614174000",
+                session_id=_SESSION_ID,
             )
         return _cli(returncode=0, result="PONG")
 
@@ -1219,7 +1251,7 @@ def test_prompt_reports_usage_for_each_retry_attempt(monkeypatch):
         ("hello", None),
         (
             "Continue where you left off. Do not repeat work you already completed.",
-            "123e4567-e89b-12d3-a456-426614174000",
+            _SESSION_ID,
         ),
     ]
 
@@ -1228,7 +1260,7 @@ def test_prompt_limits_max_output_to_two_continuations(monkeypatch):
     _disable_profiler(monkeypatch)
     monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
     prompts = []
-    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    session_id = _SESSION_ID
 
     def fake_run_codex(self, user_message, tools, **kwargs):
         prompts.append((user_message, kwargs.get("resume_session_id")))
