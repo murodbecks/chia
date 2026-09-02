@@ -502,19 +502,19 @@ class CodexLLM(LLMCallBase):
                 "attempt": len(attempt_records) + 1,
                 "success": success,
                 "error": error,
-                "metadata": dict(self._last_metadata or {}),
+                "metadata": self._last_metadata.copy(),
             })
 
         def attach_attempt_metadata(
             exception: BaseException | None = None,
         ) -> None:
             self._last_metadata = {
-                **dict(self._last_metadata or {}),
+                **self._last_metadata.copy(),
                 "provider_attempts": len(attempt_records),
                 "attempts": list(attempt_records),
             }
             if exception is not None:
-                exception.usage_metadata = dict(self._last_metadata)
+                exception.usage_metadata = self._last_metadata.copy()
         tool_list = tools or []
         capacity_attempt = 0
 
@@ -643,7 +643,7 @@ class CodexLLM(LLMCallBase):
             session_bundle=self._session_bundle,
             session_bundle_paths=self._session_bundle_paths,
         )
-        result.usage_metadata = dict(self._last_metadata)
+        result.usage_metadata = self._last_metadata.copy()
         return result
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
@@ -951,9 +951,7 @@ class CodexLLM(LLMCallBase):
                         if not isinstance(event, dict):
                             continue
                         payload = _payload(event)
-                        event_type = str(
-                            payload.get("type") or event.get("type") or ""
-                        ).lower()
+                        event_type = cls._event_type(event)
                         if event_type == "compacted":
                             events.append({
                                 "type": "compacted",
@@ -965,8 +963,9 @@ class CodexLLM(LLMCallBase):
                 continue
         return cls._context_metadata_from_rollout_events(events)
 
-    @staticmethod
+    @classmethod
     def _context_metadata_from_rollout_events(
+        cls,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Normalize Codex context gauges and compaction markers."""
@@ -979,9 +978,7 @@ class CodexLLM(LLMCallBase):
 
         for event in events:
             payload = _payload(event)
-            event_type = str(
-                payload.get("type") or event.get("type") or ""
-            ).lower()
+            event_type = cls._event_type(event)
             if event_type == "compacted":
                 trigger = payload.get("trigger")
                 compactions.append({
@@ -1255,8 +1252,7 @@ class CodexLLM(LLMCallBase):
         manifest = self._session_bundle_manifest(bundle)
         self._apply_session_bundle_manifest(manifest)
         with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as tar:
-            members = tar.getmembers()
-            for member in members:
+            for member in tar.getmembers():
                 if not member.isfile():
                     continue
                 rel_path = member.name
@@ -1398,7 +1394,7 @@ class CodexLLM(LLMCallBase):
     @classmethod
     def _record_event(cls, event: dict, stream: list[str], results: list[str]) -> None:
         payload = _payload(event)
-        etype = str(payload.get("type") or event.get("type") or "").lower()
+        etype = cls._event_type(event)
         text = cls._text(payload)
 
         if "tool" in etype and any(k in etype for k in ("result", "output", "finish", "complete")):
@@ -1524,22 +1520,24 @@ class CodexLLM(LLMCallBase):
         complete session. Those events include cumulative session totals, so
         summing the whole stream charges every prior task again.
         """
-        task_starts = []
-        turn_starts = []
+        latest_task_start = None
+        latest_turn_start = None
         for index, event in enumerate(events):
             event_type = cls._event_type(event)
             if "task" in event_type and any(
                 token in event_type for token in ("start", "begin", "created")
             ):
-                task_starts.append(index)
+                latest_task_start = index
             if "turn" in event_type and any(
                 token in event_type for token in ("start", "begin")
             ):
-                turn_starts.append(index)
+                latest_turn_start = index
         start = (
-            task_starts[-1]
-            if task_starts
-            else (turn_starts[-1] if turn_starts else 0)
+            latest_task_start
+            if latest_task_start is not None
+            else latest_turn_start
+            if latest_turn_start is not None
+            else 0
         )
 
         baseline_total: dict[str, int] = {}
@@ -1640,18 +1638,13 @@ class CodexLLM(LLMCallBase):
             return
 
         node_id = self._get_node_id()
-        if cli.returncode == 0 and outcome.status != "failed":
-            raise UnknownCodexError(
-                node_id=node_id,
-                exit_code=cli.returncode,
-                raw_message=(
-                    "Codex exited successfully but did not write a final message "
-                    f"(terminal status: {outcome.status})"
-                ),
-            )
-
         message = outcome.message or cli.stderr
-        if not message:
+        if cli.returncode == 0 and outcome.status != "failed":
+            message = (
+                "Codex exited successfully but did not write a final message "
+                f"(terminal status: {outcome.status})"
+            )
+        elif not message:
             message = f"Codex terminal status: {outcome.status}"
         if outcome.status != "failed":
             raise UnknownCodexError(

@@ -38,6 +38,10 @@ from chia.models.codex import (
 )
 
 _SESSION_ID = "123e4567-e89b-12d3-a456-426614174000"
+_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model."
+_CONTINUATION_MESSAGE = (
+    "Continue where you left off. Do not repeat work you already completed."
+)
 
 
 def _event(event_type, **kwargs):
@@ -1040,10 +1044,7 @@ def test_classification_never_uses_stderr_result_or_stream(monkeypatch):
     monkeypatch.setattr(CodexLLM, "_get_node_id", lambda self: "test-node")
     cli = _cli(
         returncode=1,
-        stderr=(
-            "HTTP 400 bad request; Selected model is at capacity. "
-            "Please try a different model."
-        ),
+        stderr=f"HTTP 400 bad request; {_CAPACITY_MESSAGE}",
         result="maximum output token limit reached",
         stream_result="429 rate limit and 503 service unavailable",
         terminal_message="state db returned stale rollout path",
@@ -1071,8 +1072,8 @@ def test_non_turn_failure_is_always_unknown(status, monkeypatch):
 @pytest.mark.parametrize(
     "message",
     [
-        "Selected model is at capacity. Please try a different model.",
-        "SELECTED MODEL IS AT CAPACITY. PLEASE TRY A DIFFERENT MODEL.",
+        _CAPACITY_MESSAGE,
+        _CAPACITY_MESSAGE.upper(),
     ],
 )
 def test_classify_model_capacity_as_transient(message, monkeypatch):
@@ -1175,9 +1176,7 @@ def test_prompt_capacity_backoff_is_capped_jittered_and_has_no_final_sleep(
         calls += 1
         return _cli(
             returncode=1,
-            terminal_message=(
-                "Selected model is at capacity. Please try a different model."
-            ),
+            terminal_message=_CAPACITY_MESSAGE,
         )
 
     def fake_uniform(low, high):
@@ -1250,7 +1249,7 @@ def test_prompt_reports_usage_for_each_retry_attempt(monkeypatch):
     assert prompts == [
         ("hello", None),
         (
-            "Continue where you left off. Do not repeat work you already completed.",
+            _CONTINUATION_MESSAGE,
             _SESSION_ID,
         ),
     ]
@@ -1278,11 +1277,11 @@ def test_prompt_limits_max_output_to_two_continuations(monkeypatch):
     assert prompts == [
         ("hello", None),
         (
-            "Continue where you left off. Do not repeat work you already completed.",
+            _CONTINUATION_MESSAGE,
             session_id,
         ),
         (
-            "Continue where you left off. Do not repeat work you already completed.",
+            _CONTINUATION_MESSAGE,
             session_id,
         ),
     ]
@@ -1313,7 +1312,7 @@ def test_capacity_exhaustion_metadata_survives_ray_serialization():
     error = ModelCapacityError(
         node_id="test-node",
         exit_code=1,
-        raw_message="Selected model is at capacity. Please try a different model.",
+        raw_message=_CAPACITY_MESSAGE,
     )
     error.capacity_attempts = 8
     error.retries_exhausted = True
