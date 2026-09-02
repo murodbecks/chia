@@ -563,7 +563,6 @@ class CodexLLM(LLMCallBase):
                             exc.capacity_attempts = capacity_attempt
                             if capacity_attempt >= self.capacity_attempts:
                                 exc.retries_exhausted = True
-                                exc.retry_after_seconds = self.capacity_backoff_max_seconds
                                 attach_attempt_metadata(exc)
                                 raise
                             retry_index = capacity_attempt - 1
@@ -782,7 +781,7 @@ class CodexLLM(LLMCallBase):
             cmd.append("--skip-git-repo-check")
         if self.ephemeral:
             cmd.append("--ephemeral")
-        if self.ignore_rules:
+        if self.ignore_rules and self.allow_builtin_tools:
             cmd.append("--ignore-rules")
         if self.dangerously_bypass_approvals_and_sandbox:
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
@@ -853,11 +852,10 @@ class CodexLLM(LLMCallBase):
                 or active_resume_session_id
                 or self._session_id
             )
-            telemetry_session_id = returned_session_id
             meta.update(
                 self._rollout_context_metadata(
                     telemetry_home,
-                    telemetry_session_id,
+                    returned_session_id,
                     rollout_offsets,
                 )
             )
@@ -1503,12 +1501,10 @@ class CodexLLM(LLMCallBase):
             )
         if stream_errors:
             return CodexTerminalOutcome("fatal", stream_errors[-1])
-        if not turn_outcomes:
-            return CodexTerminalOutcome(
-                "missing",
-                "Codex JSONL stream ended without a terminal turn event",
-            )
-        raise AssertionError("unreachable terminal-outcome state")
+        return CodexTerminalOutcome(
+            "missing",
+            "Codex JSONL stream ended without a terminal turn event",
+        )
 
     @classmethod
     def _usage_for_latest_task(
@@ -1627,23 +1623,6 @@ class CodexLLM(LLMCallBase):
         if latest_total:
             meta["session_total_usage"] = latest_total
         return meta
-
-    @classmethod
-    def _record_usage(cls, event: dict, meta: dict) -> None:
-        """Compatibility helper for callers parsing one isolated event."""
-        payload = _payload(event)
-        event_type = cls._event_type(event)
-        if "turn" in event_type and any(
-            token in event_type for token in ("complete", "end", "done")
-        ):
-            meta["num_turns"] = meta.get("num_turns", 0) + 1
-        values = cls._usage_values(
-            payload.get("usage")
-            or payload.get("tokens")
-            or payload.get("token_usage")
-        )
-        for key, value in values.items():
-            meta[key] = meta.get(key, 0) + value
 
     def _classify_error(self, cli: QueryResult) -> None:
         outcome = getattr(cli, "terminal_outcome", None)

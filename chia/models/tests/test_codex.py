@@ -161,14 +161,11 @@ def test_build_cmd_flags_and_reasoning_effort():
     assert "--skip-git-repo-check" in cmd
     assert "--ephemeral" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
-    assert "--ignore-rules" in cmd
+    assert cmd.count("--ignore-rules") == 1
     for feature in codex_mod._RESTRICTED_CODEX_FEATURES:
         assert ["--disable", feature] == cmd[
             cmd.index(feature) - 1 : cmd.index(feature) + 1
         ]
-    assert ["--disable", "goals"] == cmd[
-        cmd.index("goals") - 1 : cmd.index("goals") + 1
-    ]
     assert 'model_reasoning_effort="xhigh"' in cmd
     assert cmd[-1] == "-"
 
@@ -227,11 +224,13 @@ def test_unrestricted_mode_preserves_work_dir_and_builtin_tools():
         work_dir="/tmp/work",
         allow_builtin_tools=True,
         dangerously_bypass_approvals_and_sandbox=True,
+        ignore_rules=True,
     )._build_cmd()
     assert cmd[cmd.index("--cd") + 1] == "/tmp/work"
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert "--ignore-user-config" not in cmd
     assert "--disable" not in cmd
+    assert cmd.count("--ignore-rules") == 1
 
 
 def test_restricted_mode_rejects_permission_bypass_and_profile():
@@ -1173,7 +1172,6 @@ def test_prompt_capacity_backoff_is_capped_jittered_and_has_no_final_sleep(
     assert uniform_bounds == pytest.approx([(0.8, 1.2)] * 3)
     assert caught.value.capacity_attempts == 4
     assert caught.value.retries_exhausted is True
-    assert caught.value.retry_after_seconds == 40
     assert caught.value.usage_metadata["provider_attempts"] == 4
 
 
@@ -1287,14 +1285,12 @@ def test_capacity_exhaustion_metadata_survives_ray_serialization():
     )
     error.capacity_attempts = 8
     error.retries_exhausted = True
-    error.retry_after_seconds = 300
 
     restored = cloudpickle.loads(cloudpickle.dumps(error))
 
     assert restored.error_type == "model_capacity"
     assert restored.capacity_attempts == 8
     assert restored.retries_exhausted is True
-    assert restored.retry_after_seconds == 300
 
 
 live = pytest.mark.skipif(
