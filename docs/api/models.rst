@@ -32,13 +32,18 @@ Antigravity
 Codex
 -----
 
-``CodexLLM`` runs in a restricted mode by default: Codex built-in tools and
+``CodexLLM`` enables Codex's built-in tools by default and uses the requested
+working directory, sandbox, approval policy, rules, and configured MCP servers.
+Set ``allow_builtin_tools=False`` to use restricted mode: built-in tools and
 ambient MCP servers are disabled, and only the ``ChiaTool`` methods supplied
-to a prompt are enabled. Tool-bearing calls use Codex's ``danger-full-access``
-sandbox because HTTP MCP requires network access; confinement instead comes
-from the isolated working directory, disabled built-ins, and exact MCP method
-allowlist. Set ``allow_builtin_tools=True`` only when the caller intends to
-grant Codex its normal local capabilities.
+to a prompt are enabled. Restricted tool-bearing calls use Codex's
+``danger-full-access`` sandbox because HTTP MCP requires network access;
+confinement instead comes from the isolated working directory, disabled
+built-ins, and exact MCP method allowlist.
+
+Chia does not automatically widen the sandbox when built-in tools are enabled.
+Callers combining built-in tools with HTTP ``ChiaTool`` servers must explicitly
+select a sandbox configuration that permits the required network access.
 
 With ``resume_session=True``, the backend captures the session-bearing subset
 of ``CODEX_HOME`` and carries it with the result so later prompts can resume on

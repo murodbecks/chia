@@ -135,7 +135,7 @@ def test_constructor_and_chia_surface(caplog):
         llm = CodexLLM()
     assert llm.model is None
     assert llm.codex_bin == "codex"
-    assert llm.allow_builtin_tools is False
+    assert llm.allow_builtin_tools is True
     assert llm.sandbox == "read-only"
     assert "experimental" in caplog.text
     assert "default model" in caplog.text
@@ -178,6 +178,7 @@ def test_build_cmd_flags_and_reasoning_effort():
         work_dir="/tmp/work",
         ephemeral=True,
         reasoning_effort="xhigh",
+        allow_builtin_tools=False,
     )
     cmd = llm._build_cmd(output_last_message_path="/tmp/out.txt")
     assert cmd[0] == "codex"
@@ -237,7 +238,9 @@ def test_build_cmd_safe_sandbox_flags():
 
 
 def test_restricted_mcp_tools_enable_network_without_builtin_tools():
-    cmd = CodexLLM()._build_cmd([_tool("allowed", "read")])
+    cmd = CodexLLM(allow_builtin_tools=False)._build_cmd(
+        [_tool("allowed", "read")]
+    )
 
     assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
@@ -245,10 +248,9 @@ def test_restricted_mcp_tools_enable_network_without_builtin_tools():
     assert 'mcp_servers.allowed.enabled_tools=["read"]' in cmd
 
 
-def test_unrestricted_mode_preserves_work_dir_and_builtin_tools():
+def test_default_mode_preserves_work_dir_and_builtin_tools():
     cmd = CodexLLM(
         work_dir="/tmp/work",
-        allow_builtin_tools=True,
         dangerously_bypass_approvals_and_sandbox=True,
         ignore_rules=True,
     )._build_cmd()
@@ -261,9 +263,12 @@ def test_unrestricted_mode_preserves_work_dir_and_builtin_tools():
 
 def test_restricted_mode_rejects_permission_bypass_and_profile():
     with pytest.raises(ValueError, match="allow_builtin_tools=True"):
-        CodexLLM(dangerously_bypass_approvals_and_sandbox=True)
+        CodexLLM(
+            allow_builtin_tools=False,
+            dangerously_bypass_approvals_and_sandbox=True,
+        )
     with pytest.raises(ValueError, match="profile requires"):
-        CodexLLM(profile="unsafe")
+        CodexLLM(allow_builtin_tools=False, profile="unsafe")
 
 
 def test_restricted_mode_disables_configured_mcp_servers(monkeypatch, tmp_path):
@@ -272,7 +277,9 @@ def test_restricted_mode_disables_configured_mcp_servers(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
 
-    cmd = CodexLLM()._build_cmd([_tool("allowed", "read")])
+    cmd = CodexLLM(allow_builtin_tools=False)._build_cmd(
+        [_tool("allowed", "read")]
+    )
 
     assert 'mcp_servers."ambient.server".enabled=false' in cmd
     assert "mcp_servers.allowed.enabled=true" in cmd
@@ -910,7 +917,7 @@ def test_run_codex_subprocess_flow(monkeypatch):
     assert "[Response]\nfallback" in cli.stream_result
     assert capture["kwargs"]["input"].startswith("[System Instructions]")
     assert capture["kwargs"]["timeout"] == 33
-    assert capture["kwargs"]["cwd"] != "/tmp"
+    assert capture["kwargs"]["cwd"] == "/tmp"
     assert not os.path.exists(capture["output_last_message"])
 
 
@@ -1357,6 +1364,7 @@ def test_live_codex_restricted_cannot_read_caller_work_dir(tmp_path):
         work_dir=str(tmp_path),
         timeout_seconds=180,
         ephemeral=True,
+        allow_builtin_tools=False,
     )
 
     cli = llm.prompt("Return the file contents or BLOCKED.", tools=[])

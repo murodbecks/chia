@@ -388,7 +388,7 @@ class CodexLLM(LLMCallBase):
         sandbox: str = "read-only",
         approval_policy: str = "never",
         dangerously_bypass_approvals_and_sandbox: bool = False,
-        allow_builtin_tools: bool = False,
+        allow_builtin_tools: bool = True,
         skip_git_repo_check: bool = True,
         ephemeral: bool = False,
         ignore_rules: bool = False,
