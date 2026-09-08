@@ -206,11 +206,18 @@ class TunnelManager:
         logger.info(f"Starting SSH tunnel {tunnel_ip} -> {ip}")
         logger.debug(f"Tunnel command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        # The launcher exits while SSH must keep running. Detach from its
+        # session and use a file so later diagnostics cannot hit a closed pipe
+        # (SIGPIPE) or block on an unread stderr buffer.
+        log_path = _pid_file(tunnel_ip) + ".log"
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+                start_new_session=True,
+            )
         self._procs[tunnel_ip] = proc
 
         # Write PID file for cross-process cleanup
@@ -260,7 +267,10 @@ class TunnelManager:
                 logger.info(f"Tunnel {tunnel_ip} is alive (pid {proc.pid})")
                 return
             else:
-                stderr = proc.stderr.read().decode() if proc.stderr else ""
+                with open(_pid_file(tunnel_ip) + ".log", "rb") as log:
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 8192))
+                    stderr = log.read().decode(errors="replace")
                 raise RuntimeError(
                     f"Tunnel {tunnel_ip} exited with code {ret}. stderr: {stderr}"
                 )

@@ -572,6 +572,11 @@ automatically adds an ``auth.overrides`` entry with a tunnel (a per-IP
 auto-tunneled nodes. It accepts any tunnel field except ``tunnel_ip``
 (which CHIA assigns per-worker). Common ones:
 
+Tunnel processes run in separate sessions and survive the ``chia up`` launcher.
+Their SSH diagnostics are written to
+``/tmp/chia_tunnel_<dashed-loopback-ip>.pid.log``; ``chia down`` uses the
+corresponding PID files to stop them.
+
 .. code-block:: yaml
 
    tunnel_defaults:
