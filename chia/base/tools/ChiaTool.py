@@ -346,6 +346,10 @@ def start_router(tool: ChiaTool, ip_address: str, base_port: int = 8000, max_tri
                 _PortRegistry.reserve(ip_address, port)
                 _active_servers[tool.name] = (server, thread, ip_address, port)
                 return port
+            if not thread.is_alive():
+                # A bind failure exits uvicorn immediately. Waiting out the
+                # startup deadline here adds five seconds per occupied port.
+                break
 
         # Uvicorn didn't start — shut it down and try next port.
         server.should_exit = True
