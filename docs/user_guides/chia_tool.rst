@@ -315,3 +315,7 @@ When a candidate tool port is occupied, Chia advances to the next port as soon
 as the server thread exits. The startup deadline applies only while a server
 thread is still starting. This avoids a five-second delay per occupied port
 when many independent ChiaTool servers share a worker.
+
+The Codex adapter resolves MCP URLs on the calling worker using Chia's
+``resolve_tool_url`` helper. On SSH-tunnelled workers this selects the local
+relay address, allowing tools hosted on either side of the tunnel to be used.

@@ -707,10 +707,12 @@ class CodexLLM(LLMCallBase):
         return [fn.name for fn in tool.mcp._tool_manager.list_tools()]
 
     def _mcp_config_args(self, tools: list[ChiaTool]) -> list[str]:
+        from chia.base.tools.ChiaTool import resolve_tool_url
+
         args: list[str] = []
         for tool in tools:
             port = getattr(tool, "port", 8000)
-            url = f"http://{tool.hostname}:{port}/{tool.name}/mcp"
+            url = resolve_tool_url(f"http://{tool.hostname}:{port}/{tool.name}/mcp")
             prefix = f"mcp_servers.{_toml_key(tool.name)}"
             args += ["-c", f"{prefix}.url={_toml(url)}"]
             args += ["-c", f"{prefix}.enabled=true"]

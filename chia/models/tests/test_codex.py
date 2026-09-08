@@ -172,6 +172,19 @@ def test_mcp_config_args(tool_name, expected):
     ]
 
 
+@pytest.mark.parametrize("hostname,expected_host", [
+    ("100.113.38.3", "127.0.0.2"),
+    ("localhost", "localhost"),
+])
+def test_mcp_config_uses_worker_tunnel_relay(monkeypatch, hostname, expected_host):
+    monkeypatch.setenv("CHIA_TOOL_ADVERTISE_HOST", "100.113.38.3")
+    monkeypatch.setenv("CHIA_TOOL_RELAY_HOST", "127.0.0.2")
+    tool = _tool("workspace", "run_command")
+    tool.hostname = hostname
+    args = CodexLLM()._mcp_config_args([tool])
+    assert args[1] == f'mcp_servers.workspace.url="http://{expected_host}:9001/workspace/mcp"'
+
+
 def test_build_cmd_flags_and_reasoning_effort():
     llm = CodexLLM(
         model="gpt-test",
