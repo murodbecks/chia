@@ -310,3 +310,8 @@ See also
 - :doc:`/getting-started/quickstart` — a hands-on example that ends with an agent using a ``BashTool`` to edit RTL.
 - :doc:`/concepts/overview` — how nodes, tools, agents, workers, and clusters fit together.
 - :doc:`/user_guides/profiling` — recording and visualizing a loop's execution, including agent calls.
+
+When a candidate tool port is occupied, Chia advances to the next port as soon
+as the server thread exits. The startup deadline applies only while a server
+thread is still starting. This avoids a five-second delay per occupied port
+when many independent ChiaTool servers share a worker.

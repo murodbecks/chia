@@ -2,7 +2,10 @@ import importlib
 import socket
 import time
 
+import pytest
 
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_occupied_port_is_retried_without_waiting_for_startup_deadline():
     module=importlib.import_module('chia.base.tools.ChiaTool')
     tool=module.ChiaTool('port_retry_check')
