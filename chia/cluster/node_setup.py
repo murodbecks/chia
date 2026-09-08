@@ -337,7 +337,9 @@ def allocate_worker_tunnels(
     result: dict[tuple[str, str, int], TunnelConfig] = {}
     next_addr = ipaddress.IPv4Address("127.0.0.2")
     ip_worker_count: dict[str, int] = defaultdict(int)
-    global_tool_index = 0
+    # Tool listeners share head_ip, so advance by the full requested range.
+    # The historical 100-port stride overlaps when a worker hosts >100 tools.
+    tool_offset = 0
 
     for a in assignments:
         if a.ip not in tunneled_ips:
@@ -349,8 +351,6 @@ def allocate_worker_tunnels(
         worker_offset = ip_worker_count[a.ip] * _PORT_STEP_WORKER
         ip_worker_count[a.ip] += 1
         # Global offset for tool ports (bind on shared head_ip).
-        tool_offset = global_tool_index * _PORT_STEP_DEFAULT
-        global_tool_index += 1
         tc = replace(base_tc,
             tunnel_ip=str(next_addr),
             gcs_tunnel_port=base_tc.gcs_tunnel_port + ray_offset,
@@ -363,6 +363,8 @@ def allocate_worker_tunnels(
             pre_tunnel_commands=[],
         )
         result[(a.ip, a.node_type.name, a.worker_index)] = tc
+        tool_offset += max(_PORT_STEP_DEFAULT,
+                           base_tc.tool_port_max - base_tc.tool_port_min + 1)
 
         next_addr += 1
         if next_addr == ipaddress.IPv4Address("127.0.0.1"):

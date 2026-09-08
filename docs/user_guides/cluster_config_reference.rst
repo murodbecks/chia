@@ -974,3 +974,11 @@ Workers are torn down first (in parallel), then the head:
    in a node type's ``compatible_ips`` (so the head also hosts a worker) and that
    worker isn't containerized, CHIA skips ``ray stop`` on the worker so it doesn't
    kill the head's Ray process.
+
+SSH tool port ranges
+~~~~~~~~~~~~~~~~~~~
+
+Each tunneled worker receives a distinct tool port range. The allocation stride
+is at least 100 ports and expands to the requested range width when a worker
+hosts more than 100 tool servers. Size the range for the number of independent
+``ChiaTool`` instances resident on that worker.
