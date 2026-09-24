@@ -1,0 +1,61 @@
+# Default for new runs; baseline42 and candidate41 retain their frozen runtimes.
+# Running campaigns reread their manifest cluster_file; see runs/active.json.
+# Machine inventory only; model acceptance is tied to each frozen run's source.
+# Current quality and performance evidence is tracked separately in DELIVERY.md.
+# Sanitized for public release: replace <user>, <tt-ip>, <reference-ip> etc.
+cluster_name: nllb-porting
+provider:
+  head_ip: 127.0.0.1
+auth:
+  ssh_user: <user>
+  ssh_private_key: ~/.ssh/<tt_key>
+  overrides:
+    <reference-ip>:
+      ssh_user: <reference-user>
+      ssh_private_key: ~/.ssh/<reference_key>
+available_node_types:
+  tt:
+    compatible_ips:
+    - <tt-ip>
+    num_workers: 1
+    resources:
+      tt: 2
+  reference:
+    compatible_ips:
+    - <reference-ip>
+    num_workers: 1
+    resources:
+      reference: 1
+porting:
+  tt:
+    work_dir: /home/<user>/nllb-autonomous
+    python: /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin/python
+    metal: /home/<user>/nllb-autonomous/runtimes/tt-metal-fd80faa3
+    metal_commit: fd80faa3b35fa6d38a92d08326205fc4168284ec
+    weights: /home/<user>/portforge-nllb/cache/f8d333a098d19b4fd9a8b18f94170487ad3f821d/pytorch_model.bin
+    weights_by_model:
+      600m: /home/<user>/portforge-nllb/cache/f8d333a098d19b4fd9a8b18f94170487ad3f821d/pytorch_model.bin
+      1.3b-distilled: /home/<user>/nllb-autonomous/checkpoints/1.3b-distilled
+      3.3b: /home/<user>/nllb-autonomous/checkpoints/3.3b
+    health_dir: /home/<user>/nllb-autonomous/card-health
+    lease_dir: /home/<user>/portforge-nllb
+    runtime_mounts:
+    - /home/<user>/miniconda3/envs/chia_env
+    - /opt/openmpi-v5.0.7-ulfm
+    - /opt/tenstorrent
+    - /home/<user>/portforge-tt/tt-metal/python_env
+    - /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin
+    - /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/venv
+    - /home/<user>/nllb-autonomous/checkpoints/600m
+    cards:
+    - '0000:01:00.0'
+    - 0000:c1:00.0
+    host_memory_limit_bytes: 34359738368
+    full_timeout_seconds: 64800
+  reference:
+    work_dir: /home/<reference-user>/nllb-autonomous
+    python: /home/<reference-user>/nllb-autonomous/.venv/bin/python
+    hf_home: /home/<reference-user>/nllb-autonomous/hf-cache
+    executor: direct
+    known_hosts: ~/.ssh/google_compute_known_hosts
+    host_key_alias: compute.<instance_id>
