@@ -1,0 +1,57 @@
+# Machine inventory only; model acceptance is tied to each frozen run's source.
+# Sanitized for public release: replace <user>, <tt-ip>, <reference-ip> etc.
+# TT runtime: upstream tt-metal fd80faa3 + torch 2.14 cpu env; chronos-2 weights
+# pinned and verified with `python models.py chronos2 <cache-dir> --download`.
+cluster_name: chronos2-porting
+provider:
+  head_ip: 127.0.0.1
+auth:
+  ssh_user: <user>
+  ssh_private_key: ~/.ssh/<tt_key>
+  overrides:
+    <reference-ip>:
+      ssh_user: <reference-user>
+      ssh_private_key: ~/.ssh/<reference_key>
+available_node_types:
+  tt:
+    compatible_ips:
+    - <tt-ip>
+    num_workers: 1
+    resources:
+      tt: 4
+  reference:
+    compatible_ips:
+    - <reference-ip>
+    num_workers: 1
+    resources:
+      reference: 1
+porting:
+  tt:
+    work_dir: /home/<user>/chronos2-autonomous
+    python: /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin/python
+    metal: /home/<user>/nllb-autonomous/runtimes/tt-metal-fd80faa3
+    metal_commit: fd80faa3b35fa6d38a92d08326205fc4168284ec
+    weights_by_model:
+      chronos2: /home/<user>/chronos2-autonomous/checkpoints/hf-cache/models--amazon--chronos-2/snapshots/29ec3766d36d6f73f0696f85560a422f50e8498c
+    health_dir: /home/<user>/chronos2-autonomous/card-health
+    lease_dir: /home/<user>/chronos2-autonomous
+    runtime_mounts:
+    - /home/<user>/miniconda3/envs/chia_env
+    - /opt/openmpi-v5.0.7-ulfm
+    - /opt/tenstorrent
+    - /home/<user>/portforge-tt/tt-metal/python_env
+    - /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin
+    - /home/<user>/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/venv
+    cards:
+    - '0000:01:00.0'
+    - '0000:c1:00.0'
+    - '0000:41:00.0'
+    - '0000:42:00.0'
+    host_memory_limit_bytes: 34359738368
+    full_timeout_seconds: 21600
+  reference:
+    work_dir: /home/<reference-user>/chronos2-autonomous
+    python: /home/<reference-user>/chronos2-autonomous/.venv/bin/python
+    hf_home: /home/<reference-user>/chronos2-autonomous/hf-cache
+    executor: direct
+    known_hosts: ~/.ssh/google_compute_known_hosts
