@@ -1,0 +1,58 @@
+# Machine inventory only; model acceptance is tied to each frozen run's source.
+# TT host = tt-blackhole-03 (10.127.30.203) — SHARED MACHINE (idle tmux user
+# sessions observed), driver verified + device compute tested 2026-09-24.
+# Runtime/env reused read-only from the fleet setup (same pins as -00/-04).
+cluster_name: esm2-porting
+provider:
+  head_ip: 127.0.0.1
+auth:
+  ssh_user: abror
+  ssh_private_key: ~/.ssh/id_tt_box
+  overrides:
+    34.45.168.112:
+      ssh_user: abror.shopulatov
+      ssh_private_key: ~/.ssh/google_compute_engine
+available_node_types:
+  tt:
+    compatible_ips:
+    - 10.127.30.203
+    num_workers: 1
+    resources:
+      tt: 4
+  reference:
+    compatible_ips:
+    - 34.45.168.112
+    num_workers: 1
+    resources:
+      reference: 1
+porting:
+  tt:
+    work_dir: /home/abror/esm2-autonomous
+    python: /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin/python
+    metal: /home/abror/nllb-autonomous/runtimes/tt-metal-fd80faa3
+    metal_commit: fd80faa3b35fa6d38a92d08326205fc4168284ec
+    weights_by_model:
+      esm2: /home/abror/esm2-autonomous/checkpoints/hf-cache/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c
+    health_dir: /home/abror/esm2-autonomous/card-health
+    lease_dir: /home/abror/esm2-autonomous
+    runtime_mounts:
+    - /home/abror/miniconda3/envs/chia_env
+    - /opt/openmpi-v5.0.7-ulfm
+    - /opt/tenstorrent
+    - /home/abror/portforge-tt/tt-metal/python_env
+    - /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin
+    - /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/venv
+    cards:
+    - '0000:01:00.0'
+    - '0000:c1:00.0'
+    - '0000:41:00.0'
+    - '0000:42:00.0'
+    host_memory_limit_bytes: 34359738368
+    full_timeout_seconds: 21600
+  reference:
+    work_dir: /home/abror.shopulatov/esm2-autonomous
+    python: /home/abror.shopulatov/esm2-autonomous/.venv/bin/python
+    hf_home: /home/abror.shopulatov/esm2-autonomous/hf-cache
+    executor: direct
+    known_hosts: ~/.ssh/google_compute_known_hosts
+    host_key_alias: compute.4801335108534316136
