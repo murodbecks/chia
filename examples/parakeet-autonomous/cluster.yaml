@@ -1,0 +1,59 @@
+# Machine inventory only; model acceptance is tied to each frozen run's source.
+# TT host = tt-blackhole-04 (10.127.30.205) — driver verified working, device compute tested.
+# tt-blackhole-01 (.197) has the kernel module missing (see GUIDE.md admin note); weights also staged there as backup.
+# Runtime/env reused read-only from the fleet setup (same pins as tt-blackhole-00).
+# Weights staged+verified via models.py --download on this host.
+cluster_name: parakeet-porting
+provider:
+  head_ip: 127.0.0.1
+auth:
+  ssh_user: abror
+  ssh_private_key: ~/.ssh/id_tt_box
+  overrides:
+    34.45.168.112:
+      ssh_user: abror.shopulatov
+      ssh_private_key: ~/.ssh/google_compute_engine
+available_node_types:
+  tt:
+    compatible_ips:
+    - 10.127.30.205
+    num_workers: 1
+    resources:
+      tt: 4
+  reference:
+    compatible_ips:
+    - 34.45.168.112
+    num_workers: 1
+    resources:
+      reference: 1
+porting:
+  tt:
+    work_dir: /home/abror/parakeet-autonomous
+    python: /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin/python
+    metal: /home/abror/nllb-autonomous/runtimes/tt-metal-fd80faa3
+    metal_commit: fd80faa3b35fa6d38a92d08326205fc4168284ec
+    weights_by_model:
+      parakeet: /home/abror/parakeet-autonomous/checkpoints/hf-cache/models--nvidia--parakeet-tdt-0.6b-v3/snapshots/541d1f99c6b0c3cd0b11a95167540bb8edefd82b
+    health_dir: /home/abror/parakeet-autonomous/card-health
+    lease_dir: /home/abror/parakeet-autonomous
+    runtime_mounts:
+    - /home/abror/miniconda3/envs/chia_env
+    - /opt/openmpi-v5.0.7-ulfm
+    - /opt/tenstorrent
+    - /home/abror/portforge-tt/tt-metal/python_env
+    - /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/bin
+    - /home/abror/nllb-autonomous/environments/upstream-fd80faa3-tokenizer/venv
+    cards:
+    - '0000:01:00.0'
+    - '0000:c1:00.0'
+    - '0000:41:00.0'
+    - '0000:42:00.0'
+    host_memory_limit_bytes: 34359738368
+    full_timeout_seconds: 21600
+  reference:
+    work_dir: /home/abror.shopulatov/parakeet-autonomous
+    python: /home/abror.shopulatov/parakeet-autonomous/.venv/bin/python
+    hf_home: /home/abror.shopulatov/parakeet-autonomous/hf-cache
+    executor: direct
+    known_hosts: ~/.ssh/google_compute_known_hosts
+    host_key_alias: compute.4801335108534316136
