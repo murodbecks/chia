@@ -1,0 +1,5 @@
+__pycache__/
+runs/
+# Machine inventories with real hosts, users and paths stay local.
+cluster.local.yaml
+*.local.yaml
